@@ -50,24 +50,8 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-## Key Pages & Features
-
-- `/` — Home page
-- `/test-negotiation` — Test negotiation modal and match details (demo)
-- `/kyc-test` — KYC onboarding/test page
-- `/admin/kyc` — Admin KYC dashboard
-
-## Project Structure
-
-- `src/app/` — Next.js app directory (pages, API routes)
-- `src/components/` — React components (UI, home, modals)
-- `src/models/schemas/` — Data models (user, parcel, match, kyc, etc.)
-- `src/lib/` — Database and service logic
-
 ## Development Notes
 - Ensure MongoDB is running locally or update `MONGODB_URI` for your setup.
 - Auth0 must be configured for authentication to work.
 - Test/demo pages are included for development and should be removed or protected in production.
 
-## License
-MIT (or your license here)
