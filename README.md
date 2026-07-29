@@ -1,124 +1,163 @@
 # ParceFlyte
 
-ParceFlyte is a peer-to-peer parcel delivery platform that connects senders with travelers (carriers) who have spare luggage capacity along a route they are already taking. The platform handles carrier discovery, multi-factor match scoring, fee negotiation, escrowed payment, two-sided ratings, and a KYC/compliance layer with an admin review workflow.
+ParceFlyte is a peer-to-peer parcel delivery platform that connects senders with travellers (carriers) who have spare luggage capacity along a route they are already taking. It handles carrier discovery, multi-factor match scoring, fee negotiation, escrowed payment, two-sided ratings, and a KYC/compliance layer with an admin review queue.
 
-> **Project status:** pre-alpha. The data layer, matching engine, and the parcel/travel/match/payment/rating APIs are implemented. The KYC subsystem currently exists as UI components plus a schema — its API routes are not yet built. See [Implementation status](#implementation-status) for the exact gap list before running the app.
+**It runs with zero configuration.** Clone, `npm install`, `npm run dev` — no database, no Auth0 tenant. The app boots in demo mode against a seeded in-memory dataset and a fixed demo user, so every screen is explorable immediately. Point `MONGODB_URI` and the Auth0 variables at real infrastructure and the same code runs against those instead.
 
 ---
 
 ## Table of contents
 
+- [Quick start](#quick-start)
 - [Domain model](#domain-model)
 - [System architecture](#system-architecture)
+- [Demo mode](#demo-mode)
 - [Repository layout](#repository-layout)
 - [Tech stack](#tech-stack)
 - [Data model](#data-model)
 - [API reference](#api-reference)
 - [Matching engine](#matching-engine)
-- [Negotiation flow](#negotiation-flow)
+- [Fee rules and negotiation](#fee-rules-and-negotiation)
 - [Payments and escrow](#payments-and-escrow)
-- [KYC and compliance subsystem](#kyc-and-compliance-subsystem)
+- [KYC and compliance](#kyc-and-compliance)
 - [Authentication and authorization](#authentication-and-authorization)
 - [Frontend architecture](#frontend-architecture)
-- [Getting started](#getting-started)
-- [Implementation status](#implementation-status)
-- [Roadmap](#roadmap)
+- [Running against MongoDB and Auth0](#running-against-mongodb-and-auth0)
+- [Known gaps](#known-gaps)
 - [License](#license)
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/yourusername/parceflyte.git
+cd ParceFlyte
+npm install
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). You are signed in as **Calvin Andoh**, a seeded user with parcels in flight, an upcoming trip, an open negotiation, and the admin role.
+
+| Script | What it does |
+| --- | --- |
+| `npm run dev` | Dev server on port 3000 |
+| `npm run build` | Production build |
+| `npm start` | Serve the production build |
+| `npm run lint` | ESLint |
+| `npm run seed` | Load the demo dataset + indexes into MongoDB (needs `MONGODB_URI`) |
+
+### A tour worth taking
+
+1. **`/dashboard`** — counters, and anything waiting on your reply pinned to the top.
+2. **`/parcels/652f1c0000000000000000c1`** — the matching engine's output. Every carrier on the route scored 0–100; hit **Why this score?** for the per-factor breakdown and the fee build-up.
+3. **`/matches`** → **Respond** — the negotiation thread. Counter-offer, accept, or decline. The guardrails are live: you cannot counter twice in a row, accept your own offer, or exceed the fee cap.
+4. After accepting, open the parcel and walk it through **picked up → in transit → delivered**. Escrow releases on delivery, and a review form appears.
+5. **Leave a review** — the score feeds straight back into that carrier's reputation, which is 10% of every future match score.
+6. **`/kyc`** — the three-step verification flow. Clean applications auto-approve; flagged ones route to review.
+7. **`/admin/kyc`** — the review queue, with risk scores and compliance results.
+
+**Reset data** in the top banner restores the seed at any point.
 
 ---
 
 ## Domain model
 
-Five core entities drive the whole system:
-
 | Entity | Meaning |
 | --- | --- |
-| **User** | An account. Holds Auth0 identity, profile, roles (`sender` / `carrier` / `admin`), KYC status, payment methods, and an aggregate rating. |
-| **Travel** | A trip a carrier is taking — origin, destination, dates, transport mode, available weight/volume capacity, and a base delivery fee. |
-| **Parcel** | A package a sender wants delivered — dimensions, weight, declared value, category, special handling needs, recipient, and delivery deadline. |
-| **Match** | A proposed pairing of one parcel with one travel. Carries the match score, the negotiation thread, the agreed terms, and the accept/reject state. |
-| **Payment** | Money held in escrow against an accepted match, released on delivery confirmation or refunded on dispute. |
-
-Supporting entities: **Rating** (two-sided post-delivery reviews) and **KYC** (identity verification, risk scoring, and compliance screening records).
-
-The happy path:
+| **User** | An account: identity, roles (`sender` / `carrier` / `admin`), KYC status, and an aggregate rating. |
+| **Travel** | A trip a carrier is taking — origin, destination, dates, mode, spare weight/volume, base fee. |
+| **Parcel** | Something to deliver — origin, recipient, weight, volume, declared value, handling needs, deadline. |
+| **Match** | A proposed pairing of one parcel with one travel. Holds the score, the negotiation thread, the agreed terms. |
+| **Payment** | Money escrowed against an accepted match, released on delivery or refunded on dispute. |
+| **Rating** | Two-sided post-delivery review. |
+| **KYC** | Identity verification, risk score, and compliance screening for a user. |
 
 ```
 sender posts Parcel ─┐
-                     ├─► Matching engine scores candidate pairs ─► Match (proposed)
-carrier posts Travel ┘                                                  │
-                                                                        ▼
-                                                    negotiate fee (back-and-forth)
-                                                                        │
-                                                                        ▼
-                                              accept ─► Payment funded into escrow
-                                                                        │
-                                                                        ▼
-                                            pickup → in_transit → delivered
-                                                                        │
-                                                                        ▼
-                                       escrow released ─► both parties rate each other
+                     ├─► engine scores candidate pairs ─► Match (proposed)
+carrier posts Travel ┘                                        │
+                                                              ▼
+                                             negotiate fee (either side counters)
+                                                              │
+                                                              ▼
+                                    accept ─► escrow funded, capacity decremented,
+                                              competing matches expired
+                                                              │
+                                                              ▼
+                                    picked up → in transit → delivered
+                                                              │
+                                                              ▼
+                                     escrow released ─► both parties rate each other
 ```
 
 ---
 
 ## System architecture
 
-ParceFlyte is a single Next.js 14 App Router application. There is no separate backend service — API routes and React pages are deployed as one unit, talking directly to MongoDB via the native driver.
+One Next.js 14 App Router application. No separate backend — API routes and React pages deploy as a unit and talk to the data layer directly.
 
 ```
-┌───────────────────────────────────────────────────────────────────┐
-│  Browser                                                          │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐   │
-│  │ Marketing    │  │ Dashboard    │  │ Admin (KYC review)     │   │
-│  │ (/)          │  │ (/dashboard) │  │ (/admin/kyc)           │   │
-│  └──────────────┘  └──────────────┘  └────────────────────────┘   │
-│         React 18 client components · Tailwind · Radix UI          │
-└──────────────────────────────┬────────────────────────────────────┘
-                               │ fetch() with Auth0 session cookie
-┌──────────────────────────────▼────────────────────────────────────┐
-│  Next.js App Router (src/app)                                     │
-│                                                                   │
-│  /api/auth/[auth0] ──── handleAuth() ──► Auth0 tenant             │
-│                                                                   │
-│  Every other route is wrapped in withApiAuthRequired() and pulls  │
-│  a scoped access token via getAccessToken({ scopes: [...] })      │
-│                                                                   │
-│  ┌─────────────┐ ┌─────────────┐ ┌──────────┐ ┌────────────────┐  │
-│  │ /api/users  │ │ /api/travels│ │ /api/    │ │ /api/matches   │  │
-│  │ /api/parcels│ │ /api/flights│ │ payments │ │  └ accept      │  │
-│  │ /api/ratings│ │ /api/search │ │          │ │  └ reject      │  │
-│  └─────────────┘ └─────────────┘ └──────────┘ │  └ negotiate   │  │
-│                                               └────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────────┐ │
-│  │ /api/matching  ·  /api/matching/auto                         │ │
-│  └───────────────────────────┬──────────────────────────────────┘ │
-└──────────────────────────────┼────────────────────────────────────┘
-                               │
-┌──────────────────────────────▼────────────────────────────────────┐
-│  src/lib/matching-service.js — weighted scoring engine (singleton)│
-└──────────────────────────────┬────────────────────────────────────┘
-                               │
-┌──────────────────────────────▼────────────────────────────────────┐
-│  src/lib/db.js — cached MongoClient promise (HMR-safe in dev)     │
-└──────────────────────────────┬────────────────────────────────────┘
-                               │
-┌──────────────────────────────▼────────────────────────────────────┐
-│  MongoDB — database `parceflyte`                                  │
-│  collections: users · travels · parcels · matches ·               │
-│               payments · ratings · (kyc)                          │
-└───────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Browser — React 18 client components, Tailwind, Radix               │
+│  SessionProvider bootstraps from /api/session                        │
+│  AppShell provides nav chrome for every signed-in page               │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │ fetch()
+┌──────────────────────────────▼───────────────────────────────────────┐
+│  Next.js App Router (src/app)                                        │
+│                                                                      │
+│  Every route wrapped in withAuth(scopes, handler) — src/lib/auth.js   │
+│  Delegates to Auth0 when configured, demo session when not           │
+│                                                                      │
+│  /api/session   /api/users    /api/travels   /api/parcels            │
+│  /api/matches   ├─ [id]/accept · reject · negotiate                  │
+│  /api/matching  ├─ /auto                                             │
+│  /api/payments  /api/ratings  /api/kyc  /api/admin/kyc               │
+│  /api/demo/reset                                                     │
+└────────────┬──────────────────────────────┬──────────────────────────┘
+             │                              │
+┌────────────▼────────────┐   ┌─────────────▼──────────────────────────┐
+│ matching-service.js     │   │ kyc-service.js                         │
+│ weighted scoring, fee   │   │ risk scoring, compliance screening,    │
+│ quoting, distance       │   │ document verification                  │
+└────────────┬────────────┘   └─────────────┬──────────────────────────┘
+             │                              │
+┌────────────▼──────────────────────────────▼──────────────────────────┐
+│  src/lib/db.js — getDb()                                             │
+│                                                                      │
+│    MONGODB_URI set?  ──yes──►  MongoDB (native driver)               │
+│                      ──no───►  demo-store.js (in-memory)             │
+│                                                                      │
+│  Both expose the same .collection(name) surface, so no route         │
+│  knows which one it is talking to.                                   │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-### Key architectural decisions
+### Key decisions
 
-**MongoDB native driver, not an ODM.** [`src/lib/db.js`](parceflyte-v1/src/lib/db.js) exports a module-scoped `MongoClient` promise. In development it stashes the promise on `global._mongoClientPromise` so Hot Module Replacement doesn't open a new connection pool on every edit; in production it connects once per process. The driver returns plain documents, so there is no model layer between the routes and the database.
+**One data interface, two backends.** [`src/lib/db.js`](src/lib/db.js) exports `getDb()`. [`src/lib/demo-store.js`](src/lib/demo-store.js) implements the subset of the MongoDB collection API the routes use — `find/sort/skip/limit/toArray`, `findOne`, `insertOne`, `updateOne`, `countDocuments`, with `$in`, `$gte`, `$lte`, `$or`, `$regex`, `$set`, `$push`, `$inc`, and dotted paths. This is what makes zero-config startup possible without a second code path through the app.
 
-**Schemas are documentation, not enforcement.** Everything in [`src/models/schemas/`](parceflyte-v1/src/models/schemas/) is a plain JavaScript object literal describing field types, enums, and defaults. Nothing validates against them at runtime — API routes do their own inline required-field checks. They are the reference for what a document should look like, and the place to change first when the shape evolves.
+**`toId()` bridges id types.** Mongo needs `ObjectId`; the demo store compares ids as strings. Every route uses `toId()` and never constructs an `ObjectId` directly, so the same query works on both. Demo ids are 24-char hex, so the seed loads into MongoDB unchanged.
 
-**Matching is a stateless service singleton.** [`src/lib/matching-service.js`](parceflyte-v1/src/lib/matching-service.js) exports one instantiated `MatchingService`. It holds only the scoring weights as state; every method takes the documents it needs as arguments or reads them fresh. That keeps it trivially testable and safe to share across concurrent requests.
+**Auth is a wrapper, not a fork.** Routes call `withAuth(['read:parcels'], handler)`. With Auth0 configured it delegates to `withApiAuthRequired` and requests a scoped token; without it, the handler runs as the demo user. Handlers receive `ctx.user` either way.
 
-**Authorization is scope-based, delegated to Auth0.** No route reads a role off the user document to gate access. Each handler asks Auth0 for an access token carrying a specific scope (`read:parcels`, `write:matches`, …); if the token can't be issued, the request fails. Roles on the user document are for display and business logic, not access control.
+**Matching is a stateless singleton.** [`matching-service.js`](src/lib/matching-service.js) holds only weights as state. Every method takes what it needs as arguments, so it is safe to share across concurrent requests and trivial to test.
+
+**Schemas document, routes enforce.** The files in [`src/models/schemas/`](src/models/schemas/) describe document shape. Validation is explicit in each route via `requireFields` and typed checks from [`src/lib/api.js`](src/lib/api.js).
+
+---
+
+## Demo mode
+
+Demo mode is on whenever `MONGODB_URI` is unset, or `NEXT_PUBLIC_DEMO_MODE=true`.
+
+- **Data** comes from [`src/lib/demo-data.js`](src/lib/demo-data.js): 8 users, 13 trips, 5 parcels, 4 matches, payments, ratings, and 3 KYC applications at different stages. Dates are generated relative to load time, so trips are always upcoming and deadlines never stale.
+- **State** lives on `globalThis`, so it survives hot module replacement — anything you create while developing is still there after an edit. It resets when the server restarts, or via `POST /api/demo/reset`.
+- **The session** is a fixed user (`DEMO_SESSION_USER` in [`src/lib/auth.js`](src/lib/auth.js)) holding the `sender`, `carrier` and `admin` roles so every surface is reachable.
+- **File uploads** in the KYC flow record the file name only; nothing is stored.
+
+Auth0 and MongoDB are independent switches. Configuring one without the other works fine.
 
 ---
 
@@ -126,50 +165,56 @@ ParceFlyte is a single Next.js 14 App Router application. There is no separate b
 
 ```
 ParceFlyte/
-├── README.md                       ← this file (the only doc in the repo)
-└── parceflyte-v1/                  ← the Next.js application
-    ├── next.config.mjs             ← ESLint errors ignored during builds
-    ├── package.json
-    ├── public/
-    │   └── logo.png
-    └── src/
-        ├── app/                    ← App Router: pages + API routes
-        │   ├── layout.js           ← root layout, fonts, globals.css
-        │   ├── page.js             ← marketing home page
-        │   ├── globals.css         ← Tailwind directives + CSS custom properties
-        │   ├── (auth)/             ← route group, no URL segment
-        │   │   ├── login/          ← /login
-        │   │   └── register/       ← /register
-        │   ├── dashboard/          ← /dashboard — carrier/sender workspace
-        │   ├── admin/kyc/          ← /admin/kyc — KYC review queue
-        │   ├── kyc-test/           ← /kyc-test — demo harness (remove for prod)
-        │   ├── test-negotiation/   ← /test-negotiation — demo harness (remove for prod)
-        │   └── api/                ← all backend endpoints (see API reference)
-        │
-        ├── components/
-        │   ├── ui/                 ← shadcn/ui primitives over Radix
-        │   ├── home/               ← navbar, hero, hero-cards, about, features
-        │   ├── auth-form.js        ← shared login/register form
-        │   ├── match-details-card.jsx      ← per-factor match score breakdown
-        │   ├── match-negotiation-modal.jsx ← fee negotiation UI (largest component)
-        │   ├── kyc-onboarding-form.jsx     ← KYC entry point
-        │   ├── kyc-stepper-modal.jsx       ← multi-step KYC wizard
-        │   └── admin-kyc-review-modal.jsx  ← admin approve/reject UI
-        │
-        ├── lib/
-        │   ├── db.js               ← MongoClient singleton
-        │   ├── matching-service.js ← scoring engine
-        │   └── utils.js            ← cn() — clsx + tailwind-merge
-        │
-        ├── models/schemas/         ← document shape definitions
-        │   ├── user.js  parcel.js  travel.js  match.js
-        │   ├── payment.js  rating.js  kyc.js
-        │   └── flight.js           ← unused mongoose stub (see status section)
-        │
-        └── assets/images/
+├── jsconfig.json            ← @/* → ./src/*
+├── tailwind.config.js       ← theme tokens, including success/warning
+├── postcss.config.mjs
+├── next.config.mjs
+├── .env.example             ← every variable, all optional
+├── scripts/
+│   └── seed.mjs             ← load demo data + indexes into MongoDB
+└── src/
+    ├── app/
+    │   ├── layout.js                 ← SessionProvider + Toaster
+    │   ├── error.js                  ← route-level error boundary
+    │   ├── global-error.js           ← root-layout failures
+    │   ├── not-found.js              ← 404
+    │   ├── page.js                   ← marketing home
+    │   ├── (auth)/login · register
+    │   ├── dashboard/                ← overview
+    │   ├── parcels/  · [id]/         ← list, create, detail + scored carriers
+    │   ├── travels/                  ← list, post a trip
+    │   ├── browse/                   ← carrier discovery with filters
+    │   ├── matches/                  ← negotiation inbox
+    │   ├── kyc/                      ← 3-step verification
+    │   ├── admin/kyc/                ← review queue
+    │   └── api/                      ← see API reference
+    │
+    ├── components/
+    │   ├── ui/                       ← Radix/shadcn primitives
+    │   ├── home/                     ← marketing sections
+    │   ├── app-shell.jsx             ← sidebar, mobile nav, demo banner
+    │   ├── session-provider.jsx      ← useSession()
+    │   ├── parcel-form.jsx · travel-form.jsx
+    │   ├── match-card.jsx · negotiation-modal.jsx
+    │   ├── review-section.jsx · star-rating.jsx
+    │   ├── score-badge.jsx           ← score ring + factor breakdown
+    │   ├── carrier-badge.jsx · route-line.jsx · empty-state.jsx
+    │
+    ├── lib/
+    │   ├── db.js                     ← getDb(), toId(), isDemoMode()
+    │   ├── demo-data.js              ← the seed dataset
+    │   ├── demo-store.js             ← in-memory Mongo-compatible store
+    │   ├── auth.js                   ← withAuth(), currentUser()
+    │   ├── api.js                    ← response helpers, validation
+    │   ├── matching-service.js       ← scoring and quoting
+    │   ├── kyc-service.js            ← risk, compliance, document checks
+    │   ├── matches.js                ← hydrateMatches()
+    │   ├── format.js                 ← money, dates, status → badge variant
+    │   ├── use-api.js                ← useApi() / apiFetch()
+    │   └── utils.js                  ← cn()
+    │
+    └── models/schemas/               ← document shape reference
 ```
-
-**Path alias:** imports use `@/` for `src/` (e.g. `@/lib/db`, `@/components/ui/button`). This alias requires a `jsconfig.json` that is **not currently in the repo** — see [Implementation status](#implementation-status).
 
 ---
 
@@ -178,692 +223,392 @@ ParceFlyte/
 | Layer | Choice |
 | --- | --- |
 | Framework | Next.js 14 (App Router), React 18 |
-| Language | JavaScript (no TypeScript) |
-| Database | MongoDB 6.x via the official `mongodb` native driver |
-| Auth | Auth0 (`@auth0/nextjs-auth0` v3) — scope-based access control |
-| Styling | Tailwind CSS 3, `tailwindcss-animate`, CSS custom properties for theming |
-| Components | Radix UI primitives wrapped shadcn/ui-style; `class-variance-authority`, `clsx`, `tailwind-merge` |
-| Forms | React Hook Form + `@hookform/resolvers` |
-| Dates | `date-fns`, `react-day-picker` |
-| Icons | `lucide-react`, `@radix-ui/react-icons` |
-| Command palette | `cmdk` |
-
-`zod` is listed as a dependency but is not imported anywhere yet — it is the intended validation layer for the schemas in `src/models/schemas/`.
+| Language | JavaScript |
+| Data | MongoDB via the native driver, or the in-memory demo store |
+| Auth | Auth0 (`@auth0/nextjs-auth0` v3), optional |
+| Styling | Tailwind CSS 3 with HSL custom-property tokens |
+| Components | Radix primitives, shadcn-style, `class-variance-authority` |
+| Icons | `lucide-react` |
 
 ---
 
 ## Data model
 
-Database: **`parceflyte`**. Collections below; field lists are the load-bearing subset, not exhaustive.
+Database `parceflyte`. Load-bearing fields only.
 
 ### `users`
-
 ```js
-{
-  auth0Id, email,                             // unique identity keys
-  firstName, lastName, phoneNumber, dateOfBirth,
+{ auth0Id, email, firstName, lastName, phoneNumber, dateOfBirth, avatarColor,
   address: { street, city, state, country, postalCode },
   kycStatus: 'pending' | 'verified' | 'rejected',
-  kycDocuments: [{ type: 'passport'|'drivers_license'|'national_id',
-                   documentNumber, expiryDate, verificationDate, verifiedBy }],
   roles: ['sender' | 'carrier' | 'admin'],
   rating: { average, totalReviews, completedDeliveries, successfulDeliveries },
-  paymentMethods: [{ type: 'stripe'|'paypal'|'bank_transfer', ... }],
-  isActive, createdAt, updatedAt
-}
+  paymentMethods, isActive, createdAt, updatedAt }
 ```
-
-`rating.average` and `rating.totalReviews` are denormalized onto the user and recomputed by the ratings API after each new review — the matching engine reads them directly, so it never has to aggregate the `ratings` collection.
+`rating.average` is denormalized here and recomputed by the ratings route after each review, so the matching engine never aggregates.
 
 ### `travels`
-
 ```js
-{
-  carrierId,
-  departureLocation: { city, country, ... },
-  arrivalLocation:   { city, country, ... },
-  travelMode: 'air' | 'land' | 'sea' | 'mixed',
-  transportDetails: { type: 'plane'|'train'|'bus'|'car'|'ship'|'other', ... },
+{ carrierId,
+  departureLocation / arrivalLocation: { city, country, coordinates: { latitude, longitude } },
+  travelMode: 'air'|'land'|'sea'|'mixed',
+  transportDetails: { type, carrier, reference },
   departureDate, arrivalDate,
-  availableCapacity: { weight, volume },       // decremented when a match is accepted
-  baseDeliveryFee,
-  status: 'planned' | 'confirmed' | 'in_progress' | 'completed' | 'cancelled',
-  verificationMethod: 'manual' | 'document_upload' | 'third_party',
-  rating: { average, ... }
-}
+  availableCapacity: { weight, volume },     // decremented on accept
+  baseDeliveryFee, currency,
+  status: 'planned'|'confirmed'|'in_progress'|'completed'|'cancelled',
+  verificationMethod, notes }
 ```
-
-Only travels in `planned` or `confirmed` status are considered by the matching engine.
+Coordinates are attached on write from a known-cities table, which is what makes real distance calculation possible.
 
 ### `parcels`
-
 ```js
-{
-  senderId, matchedCarrierId,
-  weight, volume, dimensions,
-  declaredValue,                               // drives the 15% fee ceiling
-  category: 'electronics'|'clothing'|'documents'|'books'|'food'|'cosmetics'|'other',
-  specialHandling: ['fragile'|'temperature_controlled'|'urgent'
-                   |'signature_required'|'photo_proof'],
-  recipient: { name, phone, address: { city, country, ... } },
-  deliveryDeadline,
-  preferredDeliveryTime: 'anytime'|'morning'|'afternoon'|'evening',
+{ senderId, title, description,
+  origin: { city, country, coordinates },     // where it is collected
+  recipient: { name, phone, address: { city, country, coordinates } },
+  weight, volume, dimensions, declaredValue,
+  category, specialHandling: [...],
+  deliveryDeadline, preferredDeliveryTime,
   status: 'pending'|'matched'|'in_transit'|'delivered'|'cancelled'|'lost',
   paymentStatus: 'pending'|'paid'|'released'|'refunded',
-  trackingHistory: [{ status: 'created'|'matched'|'picked_up'|'in_transit'
-                             |'out_for_delivery'|'delivered'|'failed_delivery',
-                      timestamp, location, note }],
+  matchedCarrierId, matchId,
   insuranceRequired, insuranceAmount,
-  disputes: [{ reason: 'damage'|'delay'|'non_delivery'|'wrong_item'|'other',
-               status: 'open'|'under_review'|'resolved'|'closed' }]
-}
+  trackingHistory: [{ status, timestamp, location, note }],
+  disputes: [...] }
 ```
+`origin` is separate from `recipient.address`. Both legs are needed to score a route.
 
 ### `matches`
-
 ```js
-{
-  parcelId, travelId, senderId, carrierId,
-  status: 'proposed' | 'accepted' | 'rejected' | 'expired' | 'cancelled',
-  matchScore,                                  // 0–1 from the matching engine
-  negotiation: {
-    initialFee, proposedFee, finalFee, currency,
-    negotiationHistory: [{ proposedBy, amount, message, timestamp }]
-  },
-  agreement: {
-    pickupLocation, pickupDate,
-    deliveryLocation, deliveryDate,
-    specialInstructions, insuranceRequired, insuranceAmount
-  },
-  messages: [{ senderId, message, timestamp, isRead }],
-  expiresAt, createdAt, updatedAt
-}
+{ parcelId, travelId, senderId, carrierId,
+  status: 'proposed'|'accepted'|'rejected'|'expired'|'cancelled',
+  matchScore,                                  // 0-100
+  proposedBy, autoMatched,
+  negotiation: { initialFee, proposedFee, finalFee, currency, suggestedRange,
+                 negotiationHistory: [{ proposedBy, proposedByRole, amount, message, timestamp }] },
+  agreement: { pickupLocation, pickupDate, deliveryLocation, deliveryDate,
+               specialInstructions, insuranceRequired, insuranceAmount },
+  expiresAt, acceptedAt, createdAt, updatedAt }
 ```
-
-`negotiationHistory` is an append-only audit trail — every counter-offer from either side is retained, so the full bargaining sequence is reconstructible.
+`negotiationHistory` is append-only — the whole bargaining sequence is reconstructible.
 
 ### `payments`
-
 ```js
-{
-  matchId, parcelId, senderId, carrierId,
-  amount, currency,
-  paymentMethod: 'stripe' | 'paypal' | 'bank_transfer' | 'crypto',
+{ matchId, parcelId, senderId, carrierId, amount, currency, paymentMethod,
   status: 'pending'|'processing'|'completed'|'failed'|'refunded'|'disputed',
-  escrowStatus: 'funded' | 'released' | 'refunded' | 'disputed',
-  releaseCondition: 'delivery_confirmed' | 'time_elapsed' | 'manual_release',
-  disputes: [{ reason: 'non_delivery'|'damage'|'delay'|'wrong_item'|'other',
-               status: 'open'|'under_review'|'resolved'|'closed',
-               priority: 'low'|'medium'|'high' }]
-}
+  escrowStatus: 'funded'|'released'|'refunded'|'disputed',
+  releaseCondition: 'delivery_confirmed'|'time_elapsed'|'manual_release',
+  disputes: [{ reason, description, status, priority, raisedBy, raisedAt }] }
 ```
-
-One payment per match — the create handler rejects a second payment for a `matchId` that already has one.
 
 ### `ratings`
-
 ```js
-{
-  parcelId, reviewerId, reviewedId,
-  ratingType: 'sender_to_carrier' | 'carrier_to_sender',
-  score, review,
-  status: 'pending' | 'published' | 'flagged' | 'removed',
-  flags: [{ reason: 'inappropriate'|'spam'|'fake'|'harassment'|'other' }],
-  helpfulness: [{ userId, vote: 'helpful' | 'not_helpful' }]
-}
+{ parcelId, reviewerId, reviewedId,
+  ratingType: 'sender_to_carrier'|'carrier_to_sender',
+  score, review, status, flags, helpfulness }
 ```
 
-One rating per (parcel, reviewer, direction) — duplicates are rejected. On write, the reviewed user's aggregate `rating` is recomputed and written back to the `users` document.
-
 ### `kyc`
-
-Documented in detail under [KYC and compliance subsystem](#kyc-and-compliance-subsystem).
+```js
+{ kycId, userId, personalInfo, address, contactInfo,
+  identityDocuments: [{ documentType, documentNumber, issuingCountry, issueDate,
+                        expiryDate, documentImages: [...], verificationStatus }],
+  employment, financialInfo,
+  verificationProcess: { status, submittedAt, reviewedAt, approvedAt,
+                         rejectionReason, reviewedBy, reviewNotes },
+  riskAssessment: { riskScore, riskLevel, riskFactors, flagged },
+  compliance: { pepCheck, sanctionsCheck, amlCheck },
+  documentVerification: { faceMatch, documentAuthenticity, livenessCheck },
+  communicationHistory, auditTrail, expiration }
+```
 
 ---
 
 ## API reference
 
-All routes live under `parceflyte-v1/src/app/api/`. Every route except `/api/auth/[auth0]` is wrapped in `withApiAuthRequired` and requests a scoped access token. Collection endpoints accept `page` and `limit` query params and return `{ data, pagination: { page, limit, total } }`.
+Every route except `/api/auth/[auth0]` and `/api/demo/reset` goes through `withAuth`. Collection endpoints take `page` and `limit` and return `{ data, pagination: { page, limit, total, totalPages, hasMore } }`.
 
-### Auth
-
+### Session and demo
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/auth/[auth0]` | Auth0 `handleAuth()` — serves `/login`, `/logout`, `/callback`, `/me` |
+| `GET` | `/api/session` | Signed-in user + whether demo mode is on. The client bootstraps from this. |
+| `POST` | `/api/demo/reset` | Restore the seed. Demo mode only — 403 otherwise. |
+| `GET`/`POST` | `/api/auth/[auth0]` | Auth0 login/logout/callback/me; redirects in demo mode. |
 
-### Users — [`api/users/`](parceflyte-v1/src/app/api/users/)
+### Users — `read:users` / `write:users`
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/api/users` | Filters: `role`, `kycStatus` |
+| `POST` | `/api/users` | Rejects duplicate `auth0Id` or `email`; validates roles |
+| `GET`/`PUT`/`DELETE` | `/api/users/[id]` | `id` is an ObjectId or an `auth0Id`. PUT refuses `kycStatus` and `rating`. DELETE is a soft deactivate. |
 
-| Method | Route | Scope | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/api/users` | `read:users` | Filter by `role`, `kycStatus` |
-| `POST` | `/api/users` | `write:users` | Rejects a duplicate `auth0Id` |
-| `GET` | `/api/users/[id]` | `read:users` | `id` accepts an ObjectId **or** an `auth0Id` |
-| `PUT` | `/api/users/[id]` | `write:users` | |
-| `DELETE` | `/api/users/[id]` | `write:users` | Soft delete — sets `isActive: false` |
+### Travels — `read:travels` / `write:travels`
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/api/travels` | Filters: `carrierId`, cities, countries, `travelMode`, `status`, `minCapacity`, `maxFee`, dates, `upcoming`. Joins carriers in one query. |
+| `POST` | `/api/travels` | Validates mode, date order, positive capacity and fee, distinct cities. Attaches coordinates. |
+| `GET`/`PUT`/`DELETE` | `/api/travels/[id]` | Carrier-only. DELETE refuses if accepted matches exist. |
 
-### Travels — [`api/travels/`](parceflyte-v1/src/app/api/travels/)
+### Parcels — `read:parcels` / `write:parcels`
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/api/parcels` | Filters: `senderId`, `matchedCarrierId`, `status`, `category`, weight/value ranges, `deliveryDeadline` |
+| `POST` | `/api/parcels` | Validates category, handling flags, future deadline, distinct origin/destination |
+| `GET` | `/api/parcels/[id]` | Hydrated with sender and carrier |
+| `POST` | `/api/parcels/[id]` | Append a tracking event. `delivered` releases escrow. Participants only. |
+| `DELETE` | `/api/parcels/[id]` | Sender-only; refuses once in transit |
 
-| Method | Route | Scope | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/api/travels` | `read:travels` | Filters: `carrierId`, `departureCity/Country`, `arrivalCity/Country`, `travelMode`, `status`, `minCapacity`, `maxFee`, `departureDate`, `arrivalDate` |
-| `POST` | `/api/travels` | `write:travels` | Requires `carrierId`, both locations, `travelMode`, both dates, `availableCapacity`, `baseDeliveryFee` |
-| `GET` | `/api/flights` | `read:flights` | **Legacy duplicate** of `GET /api/travels` (same query, different default `limit` and scope). Prefer `/api/travels`. |
+### Matches — `read:matches` / `write:matches`
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/api/matches` | `mine=true` returns everything you are a party to, either side |
+| `POST` | `/api/matches` | Verifies parcel is open, travel is accepting, capacity fits, not self-carriage, no duplicate, fee under cap |
+| `GET`/`PUT`/`DELETE` | `/api/matches/[id]` | PUT edits agreement details only — status changes go through the endpoints below |
+| `POST` | `/api/matches/[id]/negotiate` | Append a counter-offer |
+| `GET` | `/api/matches/[id]/negotiate` | Thread + suggested range + cap |
+| `POST` | `/api/matches/[id]/accept` | Locks the fee, matches the parcel, decrements capacity, funds escrow, expires competing matches |
+| `POST` | `/api/matches/[id]/reject` | Records who declined and why |
 
-### Parcels — [`api/parcels/`](parceflyte-v1/src/app/api/parcels/)
+### Matching
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/api/matching` | With `parcelId`, returns scored candidates with breakdowns (`mode: "scored"`). Without, a plain travel search (`mode: "browse"`). |
+| `GET` | `/api/matching/auto` | Preview candidates above the threshold, creating nothing |
+| `POST` | `/api/matching/auto` | Create proposals for everything above the threshold |
 
-| Method | Route | Scope | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/api/parcels` | `read:parcels` | Filters: `senderId`, `matchedCarrierId`, `status`, `category`, `min/maxWeight`, `min/maxValue`, `deliveryDeadline` |
-| `POST` | `/api/parcels` | `write:parcels` | |
+### Payments — `read:payments` / `write:payments`
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/api/payments` | Filters incl. `escrowStatus`, amount range, `mine` |
+| `POST` | `/api/payments` | Fund escrow for an accepted match; one payment per match |
+| `PUT` | `/api/payments` | `action`: `release` \| `refund` \| `dispute` |
 
-### Matches — [`api/matches/`](parceflyte-v1/src/app/api/matches/)
+### Ratings — `read:ratings` / `write:ratings`
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET` | `/api/ratings` | Attaches reviewer identity |
+| `POST` | `/api/ratings` | Requires a delivered parcel and participation; blocks duplicates; recomputes the reviewed user's average |
 
-| Method | Route | Scope | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/api/matches` | `read:matches` | Filters: `parcelId`, `travelId`, `senderId`, `carrierId`, `status`, `minScore`, `maxFee` |
-| `POST` | `/api/matches` | `write:matches` | Verifies parcel and travel exist; rejects a duplicate (parcel, travel) pair |
-| `GET` | `/api/matches/[id]` | `read:matches` | |
-| `PUT` | `/api/matches/[id]` | `write:matches` | |
-| `DELETE` | `/api/matches/[id]` | `write:matches` | Soft cancel |
-| `POST` | `/api/matches/[id]/accept` | `write:matches` | Transactional-ish: sets match `accepted`, parcel `matched`, decrements travel capacity |
-| `POST` | `/api/matches/[id]/reject` | `write:matches` | |
-| `POST` | `/api/matches/[id]/negotiate` | `write:matches` | Appends a counter-offer (see below) |
-| `GET` | `/api/matches/[id]/negotiate` | `read:matches` | Full negotiation history |
-
-### Matching and search
-
-| Method | Route | Scope | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/api/matching` | `read:matches` | Scored candidates via the matching engine. With `parcelId`, scores against that parcel; otherwise searches by raw criteria |
-| `POST` | `/api/matching` | `write:matches` | Creates a match after re-verifying parcel, travel, and carrier |
-| `POST` | `/api/matching/auto` | `write:matches` | Auto-creates match records for the top-scoring candidates of a parcel |
-| `GET` | `/api/matching/auto` | `read:matches` | Preview auto-match suggestions without persisting (default `limit` 5) |
-| `GET` | `/api/search` | `read:search` | Carrier discovery. Overlaps heavily with `GET /api/matching` |
-
-Shared query params for discovery: `parcelId`, `departureCity`, `arrivalCity`, `departureCountry`, `arrivalCountry`, `weight`, `volume`, `maxFee`, `deliveryDeadline`, `travelMode`, `minRating`.
-
-### Payments — [`api/payments/`](parceflyte-v1/src/app/api/payments/)
-
-| Method | Route | Scope | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/api/payments` | `read:payments` | Filters: `parcelId`, `matchId`, `senderId`, `carrierId`, `status`, `escrowStatus`, `min/maxAmount` |
-| `POST` | `/api/payments` | `write:payments` | Requires an existing match; one payment per match; updates the parcel's `paymentStatus` |
-
-### Ratings — [`api/ratings/`](parceflyte-v1/src/app/api/ratings/)
-
-| Method | Route | Scope | Notes |
-| --- | --- | --- | --- |
-| `GET` | `/api/ratings` | `read:ratings` | Filters: `parcelId`, `reviewerId`, `reviewedId`, `ratingType`, `status`, `min/maxRating` |
-| `POST` | `/api/ratings` | `write:ratings` | Requires a delivered parcel; blocks duplicates; recomputes the reviewed user's aggregate rating |
+### KYC
+| Method | Route | Notes |
+| --- | --- | --- |
+| `GET`/`POST`/`PUT` | `/api/kyc` | Your application. POST enforces 18+ and blocks a second in-flight application. |
+| `POST` | `/api/kyc/documents` | Upload a document; enforces the required image set per document type; rejects expired documents |
+| `GET` | `/api/kyc/documents` | Per-document status, document numbers masked |
+| `POST` | `/api/kyc/verify` | Run risk + compliance + document checks; auto-approves when everything is clean |
+| `GET` | `/api/kyc/verify` | Status and results |
+| `GET` | `/api/admin/kyc` | Review queue, riskiest first. `?status=statistics` returns dashboard counters. |
+| `POST` | `/api/admin/kyc` | `decision`: `approve` \| `reject` \| `request_info`. Rejection requires a reason. Mirrors to `users.kycStatus`. |
+| `PUT` | `/api/admin/kyc` | Manual risk-score override, recorded in the audit trail |
 
 ---
 
 ## Matching engine
 
-[`src/lib/matching-service.js`](parceflyte-v1/src/lib/matching-service.js) scores every viable (parcel, travel) pair on five weighted factors:
+[`src/lib/matching-service.js`](src/lib/matching-service.js). Each factor scores 0–1; the weighted sum is scaled to **0–100** once, so thresholds read as percentages.
 
-| Factor | Weight | Scoring rule |
+| Factor | Weight | Rule |
 | --- | --- | --- |
-| **Route** | 35% | 0.5 per exact city match (departure, arrival); 0.25 per country-only match. Capped at 1.0 |
-| **Capacity** | 25% | Mean of the weight and volume utilization ratios. Utilization above 80% scores a full 1.0 — the engine prefers filling a carrier's remaining space over leaving it fragmented |
-| **Timing** | 20% | 0 if the travel arrives after the delivery deadline (hard fail). 1.0 for a 1–7 day buffer, 0.8 for more than 7 days, 0.5 for under 1 day |
-| **Price** | 10% | 0 if the base fee exceeds 15% of the parcel's declared value. Otherwise `max(0.5, 1 − fee/value)` |
-| **Rating** | 10% | `average / 5`, plus a trust bonus of +0.1 at 10+ reviews or +0.05 at 5+. New carriers get a neutral 0.5 rather than a 0 |
+| **Route** | 35% | Mean of two legs — parcel origin vs travel departure, recipient vs travel arrival. Same city 1.0, same country 0.5, otherwise 0. |
+| **Capacity** | 25% | Mean of weight and volume fit. Full marks at 60–100% utilization, tapering below; 0 if it does not fit. Prefers filling a carrier's remaining space over fragmenting it. |
+| **Timing** | 20% | 0 if the trip arrives after the deadline or has already departed. 1.0 for a 1–7 day buffer, 0.8 up to 21 days, 0.6 beyond, 0.5 under a day. |
+| **Price** | 10% | 0 if the base fee exceeds the parcel's fee ceiling; otherwise linear from 1.0 (free) to 0.5 (at the ceiling). |
+| **Rating** | 10% | `average / 5`, plus 0.1 at 10+ reviews or 0.05 at 5+. Carriers with no history get a neutral 0.5 rather than 0. |
 
-The score is a weighted sum rounded to two decimals.
+### Filtering
 
-### Pre-filtering
+Candidates are narrowed by query before scoring — open status, enough weight and volume, departs in the future, arrives before the deadline. Two further filters run after: a carrier cannot carry their own parcel, and **any trip scoring 0 on route is dropped entirely**. A trip from Dubai to Mumbai is not a weak candidate for a London-to-Lagos parcel; it is not a candidate.
 
-Scoring only runs on travels that already pass a MongoDB query:
+Carriers are batch-loaded with a single `$in`, so scoring a full candidate set costs two queries regardless of size.
 
-```js
-status: { $in: ['planned', 'confirmed'] },
-'availableCapacity.weight': { $gte: parcel.weight },
-'availableCapacity.volume': { $gte: parcel.volume },
-departureDate:  { $lte: new Date(parcel.deliveryDeadline) }
-```
+### Distance
 
-Optional filters (`maxFee`, `minRating`, `travelMode`, departure/arrival country) narrow this further. Results are pulled sorted by carrier rating, capped at 50 candidates, then scored and re-sorted by score. Carrier documents are fetched in a single `$in` batch and joined in memory, so scoring a full candidate set costs two queries, not N+1.
+`calculateDistance()` is a real haversine over the coordinates attached to each location, returning kilometres or `null` when coordinates are missing. It drives the distance surcharge and the "5,012 km" shown on each candidate.
 
 ### Auto-matching
 
-`autoMatchParcel()` keeps only matches scoring **≥ 70** and returns the top 5.
-
-> **Note:** `calculateMatchScore()` returns a 0–1 value, so the `>= 70` threshold in `autoMatchParcel()` filters out everything. Either the threshold should be `0.70` or the score should be scaled to 0–100 — resolve this before relying on auto-matching.
-
-### Fee estimation
-
-`calculateEstimatedFee()` starts from the travel's `baseDeliveryFee` and applies:
-
-- **+10%** if the parcel requires any special handling
-- **+ insurance** — the explicit `insuranceAmount`, or 2% of declared value
-- **+5%** for long distance (over 1000 km)
-
-`calculateDistance()` is a **stub returning a constant 500 km**, so the long-distance premium never currently fires. Wiring in real geocoding is the first thing to fix here.
-
-### Price suggestion
-
-`suggestPricing()` proposes a negotiation window: floor at 90% of base fee, ceiling at the lower of 120% of base fee or 15% of declared value, with the midpoint as the opening suggestion.
+`autoMatchParcel()` keeps candidates scoring **≥ 70** and returns the top 5. `POST /api/matching/auto` turns those into proposals, skipping pairs that already have one.
 
 ---
 
-## Negotiation flow
+## Fee rules and negotiation
 
-Fee bargaining happens on the match, before acceptance.
+### The ceiling
+
+A delivery fee may not exceed **the greater of 15% of declared value or $45**.
+
+The 15% rule protects senders of valuable parcels. On its own it makes cheap parcels undeliverable — a $60 document envelope would cap the fee at $9, which no carrier would accept. The floor keeps low-value parcels matchable; the percentage is what binds once a parcel is worth a few hundred dollars. Both live in `MatchingService.MAX_FEE_RATIO` and `MIN_FEE_CEILING`.
+
+The ceiling is enforced in three places that cannot disagree, because they all call `maxAcceptableFee()`: the price score, the opening fee on match creation, and every counter-offer.
+
+### The quote
+
+`quote()` itemises what a delivery costs:
 
 ```
-Match created (status: proposed, negotiation.initialFee set)
-        │
-        ▼
-POST /api/matches/[id]/negotiate  { proposedBy, proposedFee, message }
-        │
-        ├── reject if match.status !== 'proposed'
-        ├── reject if now > match.expiresAt
-        ├── reject if proposedBy is neither senderId nor carrierId
-        ├── reject if proposedFee > parcel.declaredValue * 0.15
-        │
-        ▼
-append { proposedBy, amount, message, timestamp } to negotiation.negotiationHistory
-set negotiation.proposedFee
-        │
-        ▼  (repeat as many rounds as both sides want, until expiry)
-        │
-POST /api/matches/[id]/accept  ──► status: accepted, finalFee locked,
-                                    parcel → matched, travel capacity decremented
+carrier's base fee
+  + 10%  if the parcel needs special handling
+  + 5%   over 1,000 km, or 10% over 5,000 km
+  ─────
+  = delivery fee, clamped to the ceiling
+  + insurance (2% of declared value, if requested)
+  ─────
+  = total the sender pays
 ```
 
-The **15% of declared value** ceiling is enforced in two independent places — the matching engine's price score and the negotiate endpoint — so a fee above it can neither be recommended nor agreed to.
+Insurance is priced separately from the carrier's fee — it is a cost of the parcel, not of the carriage. Folding it in pushed every quote into the ceiling and made differently-priced carriers look identical.
 
-The UI for this is [`match-negotiation-modal.jsx`](parceflyte-v1/src/components/match-negotiation-modal.jsx), a stepper that shows the running history and the suggested price band, paired with [`match-details-card.jsx`](parceflyte-v1/src/components/match-details-card.jsx), which renders the per-factor score breakdown (route, capacity, timing, price, carrier) returned alongside every match.
+### Negotiation
+
+```
+Match created (proposed, initialFee = quoted delivery fee)
+   │
+   ▼
+POST /api/matches/[id]/negotiate  { proposedFee, message }
+   ├── rejected unless status is 'proposed'
+   ├── rejected if expired
+   ├── rejected unless the caller is the sender or the carrier
+   ├── rejected if the caller already has the outstanding offer
+   └── rejected if the fee exceeds the ceiling
+   │
+   ▼  (alternating, any number of rounds)
+   │
+POST /api/matches/[id]/accept
+   └── rejected if you are accepting your own outstanding offer
+```
+
+The proposer is taken from the session, never from the request body — otherwise anyone could post offers as the other party.
 
 ---
 
 ## Payments and escrow
 
-Payment is escrow-first: funds are captured when a match is accepted and held until the delivery outcome is known.
-
 ```
-match accepted
-     │
-     ▼
-POST /api/payments  ──► escrowStatus: 'funded'
-                        parcel.paymentStatus: 'paid'
-     │
-     ├── delivery confirmed ────► escrowStatus: 'released'  → parcel.paymentStatus: 'released'
-     ├── release condition met ─► 'time_elapsed' / 'manual_release'
-     └── dispute opened ────────► escrowStatus: 'disputed'  → admin resolution
-                                  └─ refund ► 'refunded'
+match accepted ──► payment created, escrowStatus: 'funded', parcel paymentStatus: 'paid'
+                   │
+                   ├── parcel marked delivered ──► escrow released to carrier
+                   ├── PUT /api/payments release/refund
+                   └── PUT /api/payments dispute ──► escrowStatus 'disputed', admin resolves
 ```
 
-Release conditions are modeled (`delivery_confirmed`, `time_elapsed`, `manual_release`) and disputes carry a reason, status, and priority. The **payment provider integration is not built** — `paymentMethod` accepts `stripe`, `paypal`, `bank_transfer`, and `crypto`, but no provider SDK is wired up and no release/refund endpoint exists yet. `POST /api/payments` records the intent and marks the parcel paid.
+Escrow is modelled end to end and the state machine works. **No payment provider is wired up** — no funds move. `paymentMethod` records intent (`stripe`, `paypal`, `bank_transfer`, `crypto`); integrating a provider means implementing capture in `POST /api/payments` and settlement in the release branch of `PUT`.
 
 ---
 
-## KYC and compliance subsystem
+## KYC and compliance
 
-The KYC layer verifies identity, scores risk, screens against compliance lists, and routes edge cases to a human reviewer. It gates matching eligibility and payment capability: `users.kycStatus` is a filterable field on the users API, and the KYC record is the source of truth behind it.
+Three steps, at `/kyc`:
 
-### Verification pipeline
-
-```
-1. Application submitted    → validate required fields, initial risk score, status: pending
-2. Documents uploaded       → store securely, AI document check, face match + liveness
-3. Automated checks         → risk assessment · PEP · sanctions · AML · authenticity + OCR
-4. Admin review             → manual review of flagged cases, request more info, approve/reject
-5. Status update            → notify user, append to audit trail, update users.kycStatus
-```
-
-### KYC document shape
-
-```js
-{
-  kycId, userId,
-  personalInfo: { firstName, lastName, middleName, dateOfBirth, nationality,
-                  gender: 'male'|'female'|'other'|'prefer_not_to_say' },
-  address: { currentAddress: { street, city, state, country, postalCode,
-                               coordinates: { latitude, longitude } },
-             previousAddresses: [...] },
-  contactInfo: { phoneNumber, email, emergencyContact },
-  identityDocuments: [{
-    documentType: 'passport'|'drivers_license'|'national_id'
-                 |'birth_certificate'|'utility_bill',
-    documentNumber, issuingCountry, issueDate, expiryDate,
-    documentImages: [{ type: 'front'|'back'|'selfie_with_document',
-                       imageUrl, uploadedAt, verifiedAt,
-                       verificationMethod: 'manual'|'ai'|'third_party' }],
-    verificationStatus: 'pending'|'verified'|'rejected'|'expired'
-  }],
-  employment: { employmentStatus: 'employed'|'self_employed'|'unemployed'
-                                 |'student'|'retired',
-                employer, jobTitle, monthlyIncome },
-  financialInfo: { bankAccounts: [{ accountType: 'checking'|'savings'|'business' }],
-                   creditCards: [{ cardType: 'visa'|'mastercard'|'amex'|'discover' }] },
-  verificationProcess: { status: 'pending'|'in_review'|'approved'|'rejected'
-                                |'requires_additional_info',
-                         submittedAt, reviewedAt, approvedAt, rejectionReason },
-  riskAssessment: { riskScore, riskLevel: 'low'|'medium'|'high'|'very_high',
-                    riskFactors: [...], flagged },
-  compliance: { pepCheck, sanctionsCheck, amlCheck },
-  documentVerification: { faceMatch, documentAuthenticity, livenessCheck },
-  communicationHistory: [{ channel: 'email'|'sms'|'in_app'|'phone', ... }],
-  auditTrail: [{ action: 'submitted'|'reviewed'|'approved'|'rejected'
-                        |'updated'|'document_uploaded', ... }],
-  expiration: { expiresAt, renewalReminderSent, autoRenewal }
-}
-```
+1. **Details** — personal info, address, contact, employment. Enforces 18+.
+2. **Documents** — passport, driver's licence or national ID. Each type declares the images it needs (a passport needs a front and a selfie; a licence also needs the back), and upload is refused until they are all present. Expired documents are rejected.
+3. **Verification** — runs risk scoring, compliance screening and document checks. Clean applications approve automatically and set `users.kycStatus` to `verified`; anything flagged goes to `/admin/kyc`.
 
 ### Risk scoring
 
-| Risk factor | Points |
+| Factor | Points |
 | --- | --- |
-| New user (account under 30 days old) | +20 |
-| International address (non-US) | +15 |
-| Document issues (rejected or expired) | +30 |
-| High-value transactions | +25 |
-| Suspicious activity patterns | +40 |
+| Account under 30 days old | +20 |
+| Address outside the primary market | +15 |
+| Document rejected, expired, or missing | +30 |
+| Parcels declared over $1,000 | +25 |
+| Suspicious activity | +40 |
 
-| Level | Score range |
-| --- | --- |
-| Low | 0–19 |
-| Medium | 20–34 |
-| High | 35–49 |
-| Very high | 50+ |
+Bands: low 0–19, medium 20–34, high 35–49, very high 50+. Flagged at 35 and up.
 
-### Compliance screening
+### Screening
 
-- **PEP** — screens against politically exposed persons databases; hits are flagged for manual review rather than auto-rejected.
-- **Sanctions** — real-time sanctions list checks; matches block the account.
-- **AML** — transaction pattern analysis and suspicious activity detection, with regulatory reporting hooks.
+[`src/lib/kyc-service.js`](src/lib/kyc-service.js) holds the simulation behind the same interface a real provider would use:
 
-### Document verification methods
+- **Sanctions and PEP** — matched against stand-in watchlists. Deterministic, so the queue is stable and the flagged path is demonstrable. Swap the list for a provider call and nothing else changes.
+- **AML** — behavioural rather than identity-based: high declared income with no employer is the pattern that draws review.
+- **Documents** — face match, authenticity and liveness scores derived from what was actually uploaded, so results reflect the user's own input.
 
-Face matching against the selfie, document authenticity checks (hologram and watermark detection), liveness detection to defeat photo spoofing, and OCR extraction to cross-check typed data against the document.
-
-### Planned KYC API
-
-These endpoints are **called by the existing UI components but not yet implemented** — building them is the largest open work item in the repo.
-
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `/api/kyc` | Fetch the current user's KYC application |
-| `POST` | `/api/kyc` | Submit a new application |
-| `PUT` | `/api/kyc` | Update an application |
-| `POST` | `/api/kyc/documents` | Upload identity documents |
-| `GET` | `/api/kyc/documents` | Document verification status |
-| `POST` | `/api/kyc/verify` | Run automated verification checks |
-| `GET` | `/api/kyc/verify` | Verification status and results |
-| `GET` | `/api/admin/kyc` | Review queue and statistics (`?status=statistics`) — admin |
-| `POST` | `/api/admin/kyc` | Approve/reject with notes — admin |
-| `PUT` | `/api/admin/kyc` | Admin-side application update |
-
-The intended security posture for this data: encryption at rest for documents, role-based admin access with MFA, an immutable audit trail on every action, and GDPR-compliant retention and erasure. External integrations anticipated here are a document verification provider, a PEP/sanctions data provider, email and SMS delivery, and object storage for document images.
+`canAutoApprove()` requires an unflagged risk score, clear results on all three compliance checks, and passes on all three document checks.
 
 ---
 
 ## Authentication and authorization
 
-Auth0 handles the full session lifecycle through the catch-all route at [`api/auth/[auth0]/route.js`](parceflyte-v1/src/app/api/auth/[auth0]/route.js), which mounts `/api/auth/login`, `/logout`, `/callback`, and `/me`.
-
-**Server side** — every API handler is wrapped:
+Routes declare the scope they need:
 
 ```js
-export const GET = withApiAuthRequired(async function getParcels(req) {
-  const { accessToken } = await getAccessToken(req, { scopes: ['read:parcels'] });
-  // ...
-});
+export const GET = withAuth(['read:parcels'], async (req, { user }) => { … });
 ```
 
-**Client side** — components read the session with the `useUser()` hook from `@auth0/nextjs-auth0/client`.
-
-### Scope catalog
-
-Define these as permissions on your Auth0 API and assign them to roles:
+With Auth0 configured this requests a scoped access token and resolves the session user. Without it, the handler runs as the demo user. Either way the handler receives `ctx.user`, and `currentUser(db, ctx.user)` resolves the ParceFlyte profile.
 
 | Resource | Read | Write |
 | --- | --- | --- |
 | Users | `read:users` | `write:users` |
 | Parcels | `read:parcels` | `write:parcels` |
 | Travels | `read:travels` | `write:travels` |
-| Flights (legacy) | `read:flights` | — |
 | Matches | `read:matches` | `write:matches` |
 | Payments | `read:payments` | `write:payments` |
 | Ratings | `read:ratings` | `write:ratings` |
-| Search | `read:search` | — |
 
-Admin capability is expressed by granting the full scope set plus the `admin` role on the user document; there is no separate `admin:*` scope namespace yet.
+Beyond scopes, routes enforce **ownership**: only a match's sender or carrier can negotiate, accept or reject it; only a parcel's sender can cancel it; only a travel's carrier can edit it. The admin nav appears only for users holding the `admin` role.
 
 ---
 
 ## Frontend architecture
 
-**Routing.** App Router with a `(auth)` route group — `login` and `register` share layout treatment without adding an `/auth` URL segment.
+**Session.** `SessionProvider` fetches `/api/session` once and exposes `useSession()` — `{ user, demoMode, loading, refresh }`. No component knows whether Auth0 is involved.
 
-**Component layers.** Three tiers, in dependency order:
+**Shell.** `AppShell` gives every signed-in page a sidebar, a mobile header with a slide-down nav, the demo banner with its reset control, and a consistent title/description/actions header.
 
-1. `components/ui/` — shadcn/ui-style primitives wrapping Radix (dialog, popover, command, calendar, form, toast, …). Styled with `class-variance-authority` variants; class conflicts resolved by `cn()` in [`lib/utils.js`](parceflyte-v1/src/lib/utils.js) (`clsx` + `tailwind-merge`).
-2. `components/home/` — marketing page sections (navbar, hero, hero-cards, about, features).
-3. Feature components at the root of `components/` — the negotiation modal, match details card, and the three KYC components.
+**Data.** `useApi(url)` returns `{ data, loading, error, reload }` and ignores responses from superseded requests. `apiFetch` surfaces the API's own error message rather than a bare status, which is why validation failures read as sentences in the UI.
 
-**Theming.** `globals.css` declares HSL CSS custom properties (`--background`, `--foreground`, …) consumed by Tailwind, giving light/dark theming without duplicating utility classes.
+**Component tiers.** `components/ui/` primitives → `components/home/` marketing sections → feature components (`match-card`, `negotiation-modal`, `parcel-form`, `travel-form`, `score-badge`, `carrier-badge`, `route-line`, `empty-state`) → pages.
 
-**Data flow.** All components are `'use client'` and fetch from the API routes directly. There is no shared client-side store or data-fetching library — each component owns its own `useState` and `fetch`.
+**Theming.** HSL custom properties in `globals.css` mapped to Tailwind tokens, including `success` and `warning`, so `statusVariant()` in [`format.js`](src/lib/format.js) can map any domain status to a badge variant in one place.
 
-### Pages
-
-| Route | Purpose |
-| --- | --- |
-| `/` | Marketing home — hero, about, features |
-| `/login`, `/register` | Auth entry points using the shared `UserAuthForm` |
-| `/dashboard` | Main workspace — post travel/parcel, search, calendar and command-palette driven |
-| `/admin/kyc` | KYC review queue and admin approve/reject |
-| `/kyc-test` | Demo harness for the KYC stepper |
-| `/test-negotiation` | Demo harness for the negotiation modal and match card |
-
-`/kyc-test` and `/test-negotiation` are development scaffolding — delete or route-guard them before any production deploy.
+**Explaining the score.** `ScoreBadge` draws the 0–100 ring; `ScoreBreakdown` renders per-factor bars with weights. On a parcel page, **Why this score?** also opens the fee build-up, including how much the ceiling removed. A number the user cannot interrogate is a number they will not trust.
 
 ---
 
-## Getting started
+## Running against MongoDB and Auth0
 
-### Prerequisites
+Copy `.env.example` to `.env.local` and fill in what you need — they are independent.
 
-- Node.js 18.17+
-- MongoDB running locally, or a MongoDB Atlas connection string
-- An Auth0 tenant with an API configured for the scopes listed above
-
-### 1. Clone and install
-
-```bash
-git clone https://github.com/yourusername/parceflyte.git
-cd ParceFlyte/parceflyte-v1
-npm install
-```
-
-### 2. Restore the missing config files
-
-The repo is currently missing build configuration that the source assumes (see [Implementation status](#implementation-status)). Create these in `parceflyte-v1/` before your first run:
-
-`jsconfig.json` — required for every `@/…` import to resolve:
-
-```json
-{
-  "compilerOptions": {
-    "paths": { "@/*": ["./src/*"] }
-  }
-}
-```
-
-`tailwind.config.js` — required for any styling to render:
-
-```js
-/** @type {import('tailwindcss').Config} */
-module.exports = {
-  darkMode: ['class'],
-  content: [
-    './src/pages/**/*.{js,jsx}',
-    './src/components/**/*.{js,jsx}',
-    './src/app/**/*.{js,jsx}',
-  ],
-  theme: {
-    container: { center: true, padding: '2rem', screens: { '2xl': '1400px' } },
-    extend: {
-      colors: {
-        border: 'hsl(var(--border))',
-        input: 'hsl(var(--input))',
-        ring: 'hsl(var(--ring))',
-        background: 'hsl(var(--background))',
-        foreground: 'hsl(var(--foreground))',
-        primary: {
-          DEFAULT: 'hsl(var(--primary))',
-          foreground: 'hsl(var(--primary-foreground))',
-        },
-        secondary: {
-          DEFAULT: 'hsl(var(--secondary))',
-          foreground: 'hsl(var(--secondary-foreground))',
-        },
-        destructive: {
-          DEFAULT: 'hsl(var(--destructive))',
-          foreground: 'hsl(var(--destructive-foreground))',
-        },
-        muted: {
-          DEFAULT: 'hsl(var(--muted))',
-          foreground: 'hsl(var(--muted-foreground))',
-        },
-        accent: {
-          DEFAULT: 'hsl(var(--accent))',
-          foreground: 'hsl(var(--accent-foreground))',
-        },
-        popover: {
-          DEFAULT: 'hsl(var(--popover))',
-          foreground: 'hsl(var(--popover-foreground))',
-        },
-        card: {
-          DEFAULT: 'hsl(var(--card))',
-          foreground: 'hsl(var(--card-foreground))',
-        },
-      },
-      borderRadius: {
-        lg: 'var(--radius)',
-        md: 'calc(var(--radius) - 2px)',
-        sm: 'calc(var(--radius) - 4px)',
-      },
-    },
-  },
-  plugins: [require('tailwindcss-animate')],
-};
-```
-
-`postcss.config.mjs`:
-
-```js
-export default {
-  plugins: { tailwindcss: {}, autoprefixer: {} },
-};
-```
-
-`.gitignore`:
-
-```
-node_modules/
-.next/
-.env*.local
-.DS_Store
-```
-
-### 3. Environment variables
-
-Create `parceflyte-v1/.env.local`:
+### MongoDB
 
 ```env
-# Database
 MONGODB_URI=mongodb://localhost:27017/parceflyte
-
-# Auth0 — AUTH0_SECRET: openssl rand -hex 32
-AUTH0_SECRET=your_auth0_secret
-AUTH0_BASE_URL=http://localhost:3000
-AUTH0_ISSUER_BASE_URL=https://your-tenant.auth0.com
-AUTH0_CLIENT_ID=your_auth0_client_id
-AUTH0_CLIENT_SECRET=your_auth0_client_secret
-AUTH0_AUDIENCE=https://api.parceflyte.com
-AUTH0_SCOPE=openid profile email
 ```
-
-`AUTH0_AUDIENCE` must match the identifier of the Auth0 API that defines the scopes — without it, `getAccessToken()` cannot issue scoped tokens and every API route will fail.
-
-In your Auth0 application settings, set the allowed callback URL to `http://localhost:3000/api/auth/callback` and the allowed logout URL to `http://localhost:3000`.
-
-### 4. Run
 
 ```bash
-npm run dev      # dev server at http://localhost:3000
-npm run build    # production build
-npm start        # serve the production build
-npm run lint     # ESLint (note: errors are ignored during builds)
+npm run seed   # loads the demo dataset and creates indexes
 ```
 
-### Recommended MongoDB indexes
+The seed drops existing collections, converts the 24-char hex ids to real `ObjectId`s, and creates the indexes the hot paths need — including `travels` on `{ status, departureDate }`, which serves the matching engine's pre-filter, and unique indexes on `users.auth0Id`, `payments.matchId` and the rating triple.
 
-None are created by the application. Add these before any meaningful data volume:
+### Auth0
 
-```js
-db.users.createIndex({ auth0Id: 1 }, { unique: true })
-db.users.createIndex({ email: 1 }, { unique: true })
-db.travels.createIndex({ status: 1, departureDate: 1 })
-db.travels.createIndex({ 'departureLocation.city': 1, 'arrivalLocation.city': 1 })
-db.travels.createIndex({ carrierId: 1 })
-db.parcels.createIndex({ senderId: 1, status: 1 })
-db.parcels.createIndex({ deliveryDeadline: 1 })
-db.matches.createIndex({ parcelId: 1, travelId: 1 })
-db.matches.createIndex({ senderId: 1, status: 1 })
-db.matches.createIndex({ carrierId: 1, status: 1 })
-db.payments.createIndex({ matchId: 1 }, { unique: true })
-db.ratings.createIndex({ reviewedId: 1, status: 1 })
+```env
+AUTH0_SECRET=            # openssl rand -hex 32
+AUTH0_BASE_URL=http://localhost:3000
+AUTH0_ISSUER_BASE_URL=https://your-tenant.auth0.com
+AUTH0_CLIENT_ID=
+AUTH0_CLIENT_SECRET=
+AUTH0_AUDIENCE=https://api.parceflyte.com
 ```
 
-The `travels` compound index on `status` + `departureDate` directly serves the matching engine's pre-filter, which is the hottest query in the system.
+Define the scopes above as permissions on the Auth0 API identified by `AUTH0_AUDIENCE`. Set the callback URL to `http://localhost:3000/api/auth/callback` and the logout URL to `http://localhost:3000`. All five of `AUTH0_SECRET`, `AUTH0_BASE_URL`, `AUTH0_ISSUER_BASE_URL`, `AUTH0_CLIENT_ID` and `AUTH0_CLIENT_SECRET` must be present, or the app stays on the demo session.
 
 ---
 
-## Implementation status
+## Known gaps
 
-### Working
+Things that are deliberately unfinished, stated plainly:
 
-- MongoDB connection layer with HMR-safe pooling
-- Users, travels, parcels, matches, payments, ratings CRUD
-- Matching engine with weighted scoring and candidate pre-filtering
-- Accept / reject / negotiate match lifecycle with capacity decrementing
-- Rating aggregation write-back to user documents
-- Auth0 session handling and scope-gated API routes
-- Full marketing site, dashboard, and KYC/negotiation UI components
-
-### Missing or broken — read before running
-
-| Item | Impact |
-| --- | --- |
-| **`jsconfig.json` absent** | Every `@/…` import fails to resolve. The app will not build. Restore it (see [step 2](#2-restore-the-missing-config-files)) |
-| **`tailwind.config.js` and PostCSS config absent** | `globals.css` emits Tailwind directives with nothing to process them — no styles render |
-| **`.gitignore` absent** | `node_modules/` and `.next/` are at risk of being committed |
-| **KYC API routes not implemented** | The KYC onboarding form, stepper, and admin review modal call `/api/kyc`, `/api/kyc/documents`, `/api/kyc/verify`, and `/api/admin/kyc` — all 404. The entire KYC subsystem is UI-only |
-| **`models/schemas/flight.js` imports mongoose** | Mongoose is not a dependency. The file is an unused leftover from an earlier design; nothing imports it. Delete it |
-| **`zod` unused** | Declared as a dependency but never imported. Schema validation is inline and inconsistent across routes |
-| **`autoMatchParcel()` threshold mismatch** | Filters on `matchScore >= 70` against a 0–1 score, so it always returns empty |
-| **`calculateDistance()` is a stub** | Returns a constant 500 km; the distance-based fee premium never applies |
-| **`GET /api/flights` duplicates `GET /api/travels`** | Two routes, one behavior, different scopes. Consolidate onto `/api/travels` |
-| **`GET /api/matching` and `GET /api/search` overlap** | Near-identical discovery logic in two places |
-| **No payment provider integration** | Escrow is modeled but no funds move; no release or refund endpoint exists |
-| **ESLint errors ignored at build time** | `next.config.mjs` sets `ignoreDuringBuilds: true`, so lint failures do not block a deploy |
-| **No tests** | No test runner or test files in the repo |
-| **Demo routes shipped** | `/kyc-test` and `/test-negotiation` are unguarded |
-
----
-
-## Roadmap
-
-**Near term** — restore the build config, implement the KYC API surface, fix the auto-match threshold, deduplicate the flights/travels and matching/search routes, adopt zod for request validation at the route boundary, and add the MongoDB indexes.
-
-**Medium term** — wire a real payment provider with escrow release and refund endpoints, replace the distance stub with a geocoding service, add real-time messaging on matches, add parcel tracking with notifications, and stand up a test suite.
-
-**Longer term** — biometric verification and third-party document verification providers, ML-based fraud detection, a native mobile app, multi-language support, and decomposition of matching and KYC into independently deployable services if load requires it.
+- **No payment provider.** Escrow state transitions work; no money moves.
+- **No document storage.** KYC uploads record a file name. Real uploads need object storage and encryption at rest.
+- **Compliance screening is simulated.** Watchlists are local arrays. The interface is provider-shaped, so replacing it is contained to `kyc-service.js`.
+- **No real-time messaging.** `matches.messages` exists in the schema but has no UI or endpoint; negotiation messages ride along with offers.
+- **No tests.** No runner is configured. The scoring functions and the demo store's query matcher are the highest-value places to start — both are pure.
+- **No email or SMS.** `communicationHistory` records that a notification would have been sent.
+- **ESLint is not enforced at build time.** `next.config.mjs` sets `ignoreDuringBuilds: true`.
+- **Demo state is per-process.** In-memory data does not survive a restart and is not shared across instances. That is fine for a demo, and is exactly why `MONGODB_URI` exists.
 
 ---
 

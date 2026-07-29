@@ -1,99 +1,66 @@
-import clientPromise from '@/lib/db';
-import { getAccessToken, withApiAuthRequired } from '@auth0/nextjs-auth0';
-import { NextResponse } from 'next/server';
-import { ObjectId } from 'mongodb';
+import { getDb, toId, idString } from '@/lib/db';
+import { withAuth, currentUser } from '@/lib/auth';
+import { ok, notFound, forbidden, badRequest } from '@/lib/api';
+import { hydrateMatches } from '@/lib/matches';
 
-export const GET = withApiAuthRequired(async function getMatch(req, { params }) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['read:matches'],
-    });
+export const GET = withAuth(['read:matches'], async (req, { params }) => {
+  const db = await getDb();
+  const match = await db.collection('matches').findOne({ _id: toId(params.id) });
+  if (!match) return notFound('Match not found');
 
-    const { id } = params;
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-
-    const match = await db.collection('matches').findOne({ _id: new ObjectId(id) });
-    if (!match) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    return NextResponse.json(match);
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
-  }
+  const [hydrated] = await hydrateMatches(db, [match]);
+  return ok({ match: hydrated });
 });
 
-export const PUT = withApiAuthRequired(async function updateMatch(req, { params }) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:matches'],
-    });
+export const PUT = withAuth(['write:matches'], async (req, { params, user }) => {
+  const db = await getDb();
+  const match = await db.collection('matches').findOne({ _id: toId(params.id) });
+  if (!match) return notFound('Match not found');
 
-    const { id } = params;
-    const body = await req.json();
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
+  const profile = await currentUser(db, user);
+  const isParty =
+    idString(match.senderId) === idString(profile?._id) ||
+    idString(match.carrierId) === idString(profile?._id);
+  if (!isParty) return forbidden('Only the sender or carrier can edit this match');
 
-    const match = await db.collection('matches').findOne({ _id: new ObjectId(id) });
-    if (!match) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    // Update match
-    const updateData = {
-      ...body,
-      updatedAt: new Date(),
-    };
-
-    // Remove fields that shouldn't be updated
-    delete updateData._id;
-    delete updateData.createdAt;
-
-    const result = await db.collection('matches').updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updateData }
-    );
-
-    if (result.matchedCount === 0) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    // Get updated match
-    const updatedMatch = await db.collection('matches').findOne({ _id: new ObjectId(id) });
-    return NextResponse.json(updatedMatch);
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  const body = await req.json();
+  // Status transitions go through /accept, /reject and /negotiate so their
+  // side effects (capacity, payments, tracking) always run.
+  const editable = ['agreement', 'messages'];
+  const updates = Object.fromEntries(Object.entries(body).filter(([key]) => editable.includes(key)));
+  if (!Object.keys(updates).length) {
+    return badRequest('Only agreement details are editable here — use /accept, /reject or /negotiate to change status');
   }
+
+  await db.collection('matches').updateOne(
+    { _id: match._id },
+    { $set: { ...updates, updatedAt: new Date() } }
+  );
+
+  const updated = await db.collection('matches').findOne({ _id: match._id });
+  const [hydrated] = await hydrateMatches(db, [updated]);
+  return ok({ message: 'Match updated', match: hydrated });
 });
 
-export const DELETE = withApiAuthRequired(async function deleteMatch(req, { params }) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:matches'],
-    });
+export const DELETE = withAuth(['write:matches'], async (req, { params, user }) => {
+  const db = await getDb();
+  const match = await db.collection('matches').findOne({ _id: toId(params.id) });
+  if (!match) return notFound('Match not found');
 
-    const { id } = params;
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
+  const profile = await currentUser(db, user);
+  const isParty =
+    idString(match.senderId) === idString(profile?._id) ||
+    idString(match.carrierId) === idString(profile?._id);
+  if (!isParty) return forbidden('Only the sender or carrier can cancel this match');
 
-    const match = await db.collection('matches').findOne({ _id: new ObjectId(id) });
-    if (!match) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    // Soft delete - mark as cancelled
-    const result = await db.collection('matches').updateOne(
-      { _id: new ObjectId(id) },
-      { $set: { status: 'cancelled', updatedAt: new Date() } }
-    );
-
-    if (result.matchedCount === 0) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    return NextResponse.json({ message: 'Match cancelled successfully' });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  if (match.status === 'accepted') {
+    return badRequest('Accepted matches cannot be cancelled here — open a dispute instead');
   }
-}); 
+
+  await db.collection('matches').updateOne(
+    { _id: match._id },
+    { $set: { status: 'cancelled', cancelledAt: new Date(), updatedAt: new Date() } }
+  );
+
+  return ok({ message: 'Match cancelled' });
+});

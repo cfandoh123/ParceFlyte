@@ -5,7 +5,7 @@ import { Badge } from '@/components/ui/badge';
 import { Button, buttonVariants } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { GitHubLogoIcon } from '@radix-ui/react-icons';
-import { Check, Linkedin } from 'lucide-react';
+import { Check, Linkedin, LockKeyhole } from 'lucide-react';
 
 export const HeroCards = () => {
   return (
@@ -101,7 +101,9 @@ export const HeroCards = () => {
             <span className="text-muted-foreground"> cost</span>
           </div>
 
-          <CardDescription>Lorem ipsum dolor sit, amet ipsum consectetur adipisicing elit.</CardDescription>
+          <CardDescription>
+            No subscription and no listing fee. You only ever pay the delivery fee you agree with your carrier.
+          </CardDescription>
         </CardHeader>
 
         <CardContent>
@@ -112,7 +114,7 @@ export const HeroCards = () => {
 
         <CardFooter className="flex">
           <div className="space-y-4">
-            {['KYC Authentication', 'Secures Information', 'Low cost'].map((benefit) => (
+            {['Identity-verified carriers', 'Payment held in escrow', 'Fees capped by parcel value'].map((benefit) => (
               <span key={benefit} className="flex">
                 <Check className="text-green-500" /> <h3 className="ml-2">{benefit}</h3>
               </span>
@@ -124,11 +126,14 @@ export const HeroCards = () => {
       {/* Service */}
       <Card className="absolute w-[350px] -right-[10px] bottom-[35px]  drop-shadow-xl shadow-black/10 dark:shadow-white/10">
         <CardHeader className="space-y-1 flex md:flex-row justify-start items-start gap-4">
-          <div className="mt-1 bg-primary/20 p-1 rounded-2xl">{/* <LightBulbIcon /> */}</div>
+          <div className="mt-1 bg-primary/20 p-2 rounded-2xl">
+            <LockKeyhole className="w-5 h-5" />
+          </div>
           <div>
-            <CardTitle>Lorem ipsum dolor</CardTitle>
+            <CardTitle>Money held in escrow</CardTitle>
             <CardDescription className="text-md mt-2">
-              Lorem ipsum dolor sit amet consect adipisicing elit. Consectetur natusm.
+              Your payment is captured when a match is accepted and released only once the parcel is confirmed
+              delivered.
             </CardDescription>
           </div>
         </CardHeader>

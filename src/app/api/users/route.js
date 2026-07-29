@@ -1,104 +1,62 @@
-import clientPromise from '@/lib/db';
-import { getAccessToken, withApiAuthRequired } from '@auth0/nextjs-auth0';
-import { NextResponse } from 'next/server';
-import { User } from '@/models';
+import { getDb, toId } from '@/lib/db';
+import { withAuth } from '@/lib/auth';
+import { ok, badRequest, conflict, pagination, paginated, requireFields } from '@/lib/api';
 
-export const GET = withApiAuthRequired(async function getUsers(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['read:users'],
-    });
+export const GET = withAuth(['read:users'], async (req) => {
+  const db = await getDb();
+  const { searchParams } = new URL(req.url);
+  const { page, limit, skip } = pagination(searchParams);
 
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-    
-    // Get query parameters
-    const { searchParams } = new URL(req.url);
-    const role = searchParams.get('role');
-    const kycStatus = searchParams.get('kycStatus');
-    const limit = parseInt(searchParams.get('limit')) || 20;
-    const page = parseInt(searchParams.get('page')) || 1;
-    const skip = (page - 1) * limit;
+  const query = { isActive: { $ne: false } };
+  if (searchParams.get('role')) query.roles = searchParams.get('role');
+  if (searchParams.get('kycStatus')) query.kycStatus = searchParams.get('kycStatus');
 
-    // Build query
-    const query = {};
-    if (role) query.roles = role;
-    if (kycStatus) query.kycStatus = kycStatus;
+  const [users, total] = await Promise.all([
+    db.collection('users').find(query).sort({ 'rating.average': -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('users').countDocuments(query),
+  ]);
 
-    const users = await db.collection('users')
-      .find(query)
-      .sort({ 'rating.average': -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-
-    const total = await db.collection('users').countDocuments(query);
-
-    return NextResponse.json({
-      users,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
-  }
+  return ok(paginated(users, total, { page, limit }));
 });
 
-export const POST = withApiAuthRequired(async function createUser(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:users'],
-    });
+export const POST = withAuth(['write:users'], async (req) => {
+  const db = await getDb();
+  const body = await req.json();
 
-    const body = await req.json();
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
+  const missing = requireFields(body, ['auth0Id', 'email', 'firstName', 'lastName']);
+  if (missing) return missing;
 
-    // Validate required fields
-    const requiredFields = ['auth0Id', 'email', 'firstName', 'lastName', 'phoneNumber', 'dateOfBirth'];
-    for (const field of requiredFields) {
-      if (!body[field]) {
-        return NextResponse.json({ error: `Missing required field: ${field}` }, { status: 400 });
-      }
-    }
+  const existing = await db.collection('users').findOne({
+    $or: [{ auth0Id: body.auth0Id }, { email: body.email }],
+  });
+  if (existing) return conflict('A user with that Auth0 id or email already exists');
 
-    // Check if user already exists
-    const existingUser = await db.collection('users').findOne({ auth0Id: body.auth0Id });
-    if (existingUser) {
-      return NextResponse.json({ error: 'User already exists' }, { status: 409 });
-    }
-
-    // Create new user
-    const newUser = {
-      ...body,
-      roles: body.roles || ['sender'],
-      kycStatus: 'pending',
-      isActive: true,
-      isVerified: false,
-      rating: {
-        average: 0,
-        totalReviews: 0,
-        completedDeliveries: 0,
-        successfulDeliveries: 0,
-      },
-      notifications: {
-        email: true,
-        push: true,
-        sms: false,
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await db.collection('users').insertOne(newUser);
-    newUser._id = result.insertedId;
-
-    return NextResponse.json(newUser, { status: 201 });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  const roles = Array.isArray(body.roles) && body.roles.length ? body.roles : ['sender'];
+  if (roles.some((role) => !['sender', 'carrier', 'admin'].includes(role))) {
+    return badRequest('roles must be any of: sender, carrier, admin');
   }
-}); 
+
+  const now = new Date();
+  const newUser = {
+    auth0Id: body.auth0Id,
+    email: body.email,
+    firstName: body.firstName,
+    lastName: body.lastName,
+    phoneNumber: body.phoneNumber || null,
+    dateOfBirth: body.dateOfBirth ? new Date(body.dateOfBirth) : null,
+    address: body.address || {},
+    kycStatus: 'pending',
+    kycDocuments: [],
+    roles,
+    rating: { average: 0, totalReviews: 0, completedDeliveries: 0, successfulDeliveries: 0 },
+    paymentMethods: [],
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const result = await db.collection('users').insertOne(newUser);
+  const created = await db.collection('users').findOne({ _id: toId(result.insertedId) });
+
+  return ok({ message: 'User created', user: created }, { status: 201 });
+});
