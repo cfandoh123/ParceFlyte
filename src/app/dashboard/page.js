@@ -1,273 +1,309 @@
 'use client';
 
-import { Navbar } from '@/components/home/navbar';
-import { Button, buttonVariants } from '@/components/ui/button';
-import { Calendar } from '@/components/ui/calendar';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem } from '@/components/ui/command';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from '@/components/ui/dialog';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
-import { ToastAction } from '@/components/ui/toast';
-import { useToast } from '@/components/ui/use-toast';
-import { cn } from '@/lib/utils';
-import { useUser } from '@auth0/nextjs-auth0/client';
-import { CalendarIcon, Check, ChevronsUpDown, CirclePlusIcon, Lightbulb, SearchCheckIcon } from 'lucide-react';
-import { useState } from 'react';
+import Link from 'next/link';
+import { Package, Plane, Handshake, Wallet, Plus, Search, ArrowRight, ShieldCheck, Star } from 'lucide-react';
 
-export default function Dashboard() {
-  const { user, error, isLoading } = useUser();
+import { AppShell } from '@/components/app-shell';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import { Skeleton } from '@/components/ui/skeleton';
+import { EmptyState } from '@/components/empty-state';
+import { MatchCard } from '@/components/match-card';
+import { RouteLine } from '@/components/route-line';
+import { useSession } from '@/components/session-provider';
+import { useApi } from '@/lib/use-api';
+import { money, shortDate, statusVariant, humanize } from '@/lib/format';
 
-  const [open, setOpen] = useState(false);
-  const [value, setValue] = useState('');
-  const [date, setDate] = useState(null);
+function StatCard({ icon: Icon, label, value, hint, href }) {
+  const body = (
+    <Card className="h-full transition-shadow hover:shadow-md">
+      <CardContent className="p-5">
+        <div className="flex items-center justify-between">
+          <p className="text-sm text-muted-foreground">{label}</p>
+          <Icon className="h-4 w-4 text-muted-foreground" />
+        </div>
+        <p className="mt-2 text-3xl font-bold tabular-nums">{value}</p>
+        {hint && <p className="mt-1 text-xs text-muted-foreground">{hint}</p>}
+      </CardContent>
+    </Card>
+  );
+  return href ? <Link href={href}>{body}</Link> : body;
+}
 
-  const data = [
-    {
-      value: 'UNA',
-      label: 'United Airlines',
-    },
-    {
-      value: 'EMR',
-      label: 'Emirates',
-    },
-    {
-      value: 'FR',
-      label: 'France Airlines',
-    },
-    {
-      value: 'BR',
-      label: 'British Airlines',
-    },
-    {
-      value: 'ET',
-      label: 'Ethiopian airlines',
-    },
-  ];
+export default function DashboardPage() {
+  const { user, loading: sessionLoading } = useSession();
+  const userId = user?._id;
 
-  const [airlines, _] = useState(data);
-  const { toast } = useToast();
+  const parcels = useApi(userId ? `/api/parcels?senderId=${userId}&limit=100` : null);
+  const travels = useApi(userId ? `/api/travels?carrierId=${userId}&limit=100` : null);
+  const matches = useApi('/api/matches?mine=true&limit=100');
+  const payments = useApi('/api/payments?mine=true&limit=100');
+  const myReviews = useApi(userId ? `/api/ratings?reviewerId=${userId}&limit=100` : null);
 
-  if (isLoading) return <div>Loading...</div>;
-  if (error) return <div>{error.message}</div>;
+  const loading = sessionLoading || parcels.loading || matches.loading;
+
+  const allParcels = parcels.data?.data || [];
+  const allTravels = travels.data?.data || [];
+  const allMatches = matches.data?.data || [];
+  const allPayments = payments.data?.data || [];
+
+  const activeParcels = allParcels.filter((p) => ['pending', 'matched', 'in_transit'].includes(p.status));
+  const upcomingTrips = allTravels.filter(
+    (t) => ['planned', 'confirmed'].includes(t.status) && new Date(t.departureDate) > new Date()
+  );
+  const openMatches = allMatches.filter((m) => m.status === 'proposed');
+  const inEscrow = allPayments
+    .filter((p) => p.escrowStatus === 'funded')
+    .reduce((sum, p) => sum + p.amount, 0);
+
+  // Matches waiting on this user surface at the top — that is the one thing
+  // that actually needs their attention.
+  const needsResponse = openMatches.filter((m) => {
+    const history = m.negotiation?.negotiationHistory || [];
+    const last = history[history.length - 1];
+    return last && String(last.proposedBy) !== String(userId) && new Date(m.expiresAt) > new Date();
+  });
+
+  // Completed deliveries this user has not reviewed yet.
+  const reviewedParcelIds = new Set((myReviews.data?.data || []).map((r) => String(r.parcelId)));
+  const awaitingReview = allParcels.filter(
+    (p) => p.status === 'delivered' && !reviewedParcelIds.has(String(p._id))
+  );
+
   return (
-    <>
-      <Navbar />
-      <h3 className="text-4xl font-bold my-6 mx-12">
-        Welcome,
-        <span className="inline bg-gradient-to-r from-[#61DAFB] via-[#1fc0f1] to-[#03a3d7] text-transparent bg-clip-text">
-          @username
-        </span>
-      </h3>
-      <section className="actions w-full mt-8 px-8 flex flex-row gap-x-8">
-        <Card className=" w-[340px] -top-[15px] drop-shadow-xl shadow-black/10 dark:shadow-white/10">
-          <CardHeader className="flex flex-row items-center gap-4 pb-2">
-            <div className="flex flex-col">
-              <CardTitle className="text-lg">Going Somewhere?</CardTitle>
+    <AppShell
+      title={sessionLoading ? 'Welcome back' : `Welcome back, ${user?.firstName || 'there'}`}
+      description="Everything moving through your account, at a glance."
+      actions={
+        <>
+          <Button asChild variant="outline">
+            <Link href="/travels">
+              <Plane className="mr-2 h-4 w-4" />
+              Post a trip
+            </Link>
+          </Button>
+          <Button asChild>
+            <Link href="/parcels">
+              <Plus className="mr-2 h-4 w-4" />
+              Send a parcel
+            </Link>
+          </Button>
+        </>
+      }>
+      {loading ? (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <Skeleton key={i} className="h-28" />
+          ))}
+        </div>
+      ) : (
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <StatCard
+            icon={Package}
+            label="Active parcels"
+            value={activeParcels.length}
+            hint={`${allParcels.length} total`}
+            href="/parcels"
+          />
+          <StatCard
+            icon={Plane}
+            label="Upcoming trips"
+            value={upcomingTrips.length}
+            hint={upcomingTrips[0] ? `Next ${shortDate(upcomingTrips[0].departureDate)}` : 'None planned'}
+            href="/travels"
+          />
+          <StatCard
+            icon={Handshake}
+            label="Open matches"
+            value={openMatches.length}
+            hint={needsResponse.length ? `${needsResponse.length} need a reply` : 'Nothing waiting on you'}
+            href="/matches"
+          />
+          <StatCard icon={Wallet} label="Held in escrow" value={money(inEscrow)} hint="Released on delivery" />
+        </div>
+      )}
 
-              <CardDescription className="mt-4">
-                <Dialog>
-                  <DialogTrigger asChild>
-                    <Button>
-                      <CirclePlusIcon className="mr-3" />
-                      Log your flight
-                    </Button>
-                  </DialogTrigger>
-                  <DialogContent className="max-w-[500px]">
-                    <DialogHeader>
-                      <DialogTitle>Log a new flight</DialogTitle>
-                      <DialogDescription>
-                        Add details of your flight and let others know. Click save when you're done.
-                      </DialogDescription>
-                    </DialogHeader>
-                    <div className="grid py-4">
-                      <div className="flex flex-col gap-4 items-start">
-                        <Label htmlFor="name" className="text-right">
-                          What airline are you travelling?
-                        </Label>
-                        <Popover open={open} onOpenChange={setOpen}>
-                          <PopoverTrigger asChild>
-                            <Button
-                              variant="outline"
-                              role="combobox"
-                              aria-expanded={open}
-                              className="w-full justify-between">
-                              {value ? airlines.find((airline) => airline.value === value)?.label : 'Select airline...'}
-                              <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                            </Button>
-                          </PopoverTrigger>
-                          <PopoverContent className="w-[200px] p-0">
-                            <Command>
-                              <CommandInput placeholder="Search airline..." />
-                              <CommandEmpty>No such airline.</CommandEmpty>
-                              <CommandGroup>
-                                {airlines &&
-                                  airlines.map((airline) => (
-                                    <CommandItem
-                                      key={airline.value}
-                                      value={airline.value}
-                                      onSelect={(currentValue) => {
-                                        setValue(currentValue === value ? '' : currentValue);
-                                        setOpen(false);
-                                      }}>
-                                      <Check
-                                        className={cn(
-                                          'mr-2 h-4 w-4',
-                                          value === airline.value ? 'opacity-100' : 'opacity-0'
-                                        )}
-                                      />
-                                      {airline.label}
-                                    </CommandItem>
-                                  ))}
-                              </CommandGroup>
-                            </Command>
-                          </PopoverContent>
-                        </Popover>
+      {/* Verification nudge */}
+      {user && user.kycStatus !== 'verified' && (
+        <Card className="mt-6 border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/30">
+          <CardContent className="flex flex-wrap items-center justify-between gap-4 p-5">
+            <div className="flex items-start gap-3">
+              <ShieldCheck className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
+              <div>
+                <p className="font-semibold">Finish your verification</p>
+                <p className="text-sm text-muted-foreground">
+                  Verified accounts get matched first and can carry higher-value parcels.
+                </p>
+              </div>
+            </div>
+            <Button asChild variant="outline">
+              <Link href="/kyc">
+                Verify identity
+                <ArrowRight className="ml-2 h-4 w-4" />
+              </Link>
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Deliveries still to review */}
+      {awaitingReview.length > 0 && (
+        <Card className="mt-6">
+          <CardContent className="flex flex-wrap items-center justify-between gap-4 p-5">
+            <div className="flex items-start gap-3">
+              <Star className="mt-0.5 h-5 w-5 shrink-0 fill-amber-400 text-amber-400" />
+              <div>
+                <p className="font-semibold">
+                  Rate {awaitingReview.length === 1 ? 'your delivery' : `${awaitingReview.length} deliveries`}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  {awaitingReview.length === 1
+                    ? `“${awaitingReview[0].title}” arrived. A quick review helps the next sender choose.`
+                    : 'Your reviews feed directly into carrier reputation scores.'}
+                </p>
+              </div>
+            </div>
+            <Button variant="outline" asChild>
+              <Link href={`/parcels/${awaitingReview[0]._id}`}>
+                Leave a review
+                <ArrowRight className="ml-2 h-4 w-4" />
+              </Link>
+            </Button>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Needs a response */}
+      {needsResponse.length > 0 && (
+        <section className="mt-8">
+          <h2 className="mb-3 text-lg font-semibold">Waiting on you</h2>
+          <div className="grid gap-4">
+            {needsResponse.slice(0, 2).map((match) => (
+              <MatchCard key={match._id} match={match} currentUserId={userId} onUpdated={matches.reload} />
+            ))}
+          </div>
+        </section>
+      )}
+
+      <div className="mt-8 grid gap-6 lg:grid-cols-2">
+        {/* Parcels */}
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-lg font-semibold">Your parcels</h2>
+            <Button variant="ghost" size="sm" asChild>
+              <Link href="/parcels">
+                View all
+                <ArrowRight className="ml-1 h-3.5 w-3.5" />
+              </Link>
+            </Button>
+          </div>
+
+          {activeParcels.length === 0 ? (
+            <EmptyState
+              icon={Package}
+              title="No parcels in flight"
+              description="List something you need delivered and we will score every travelling carrier against it."
+              action={
+                <Button asChild>
+                  <Link href="/parcels">
+                    <Plus className="mr-2 h-4 w-4" />
+                    Send a parcel
+                  </Link>
+                </Button>
+              }
+            />
+          ) : (
+            <div className="space-y-3">
+              {activeParcels.slice(0, 4).map((parcel) => (
+                <Link key={parcel._id} href={`/parcels/${parcel._id}`}>
+                  <Card className="transition-shadow hover:shadow-md">
+                    <CardContent className="p-4">
+                      <div className="mb-2 flex items-center justify-between gap-3">
+                        <p className="truncate font-medium">{parcel.title}</p>
+                        <Badge variant={statusVariant(parcel.status)}>{humanize(parcel.status)}</Badge>
                       </div>
-                      <div className="flex flex-row items-start justify-between gap-x-4">
-                        <div className="grid grid-rows-2 items-center">
-                          <Label htmlFor="name" className="text-right w-full">
-                            From
-                          </Label>
-                          <Input id="name" placeholder="Madrid" className="col-span-3" />
-                        </div>
-                        <div className="grid grid-rows-2 items-center">
-                          <Label htmlFor="username" className="text-right">
-                            To
-                          </Label>
-                          <Input id="username" placeholder="Addis Ababa" className="col-span-3" />
-                        </div>
-                      </div>
-                      <div className="flex flex-row items-start justify-between gap-x-4">
-                        <div className="grid grid-rows-2 items-center">
-                          <Label htmlFor="name" className="text-left w-full">
-                            Date
-                          </Label>
-                          <Popover>
-                            <PopoverTrigger asChild>
-                              <Button
-                                variant={'outline'}
-                                className={cn(
-                                  'w-[280px] justify-start text-left font-normal',
-                                  !date && 'text-muted-foreground'
-                                )}>
-                                <CalendarIcon className="mr-2 h-4 w-4" />
-                                {date ? format(date, 'PPP') : <span>Pick a date</span>}
-                              </Button>
-                            </PopoverTrigger>
-                            <PopoverContent className="w-auto p-0">
-                              <Calendar mode="single" selected={date} onSelect={setDate} initialFocus />
-                            </PopoverContent>
-                          </Popover>{' '}
-                        </div>
-                        <div className="grid grid-rows-2 items-center">
-                          <Label htmlFor="username" className="text-right">
-                            Time
-                          </Label>
-                          <Input id="username" placeholder="21:00" className="col-span-3" />
-                        </div>
-                      </div>
+                      <RouteLine
+                        from={parcel.origin?.city}
+                        to={parcel.recipient?.address?.city}
+                        subFrom={`${parcel.weight}kg`}
+                        subTo={`by ${shortDate(parcel.deliveryDeadline)}`}
+                      />
+                    </CardContent>
+                  </Card>
+                </Link>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Trips */}
+        <section>
+          <div className="mb-3 flex items-center justify-between">
+            <h2 className="text-lg font-semibold">Your trips</h2>
+            <Button variant="ghost" size="sm" asChild>
+              <Link href="/travels">
+                View all
+                <ArrowRight className="ml-1 h-3.5 w-3.5" />
+              </Link>
+            </Button>
+          </div>
+
+          {upcomingTrips.length === 0 ? (
+            <EmptyState
+              icon={Plane}
+              title="No upcoming trips"
+              description="Travelling soon? Post your route and earn from the luggage space you are not using."
+              action={
+                <Button asChild>
+                  <Link href="/travels">
+                    <Plus className="mr-2 h-4 w-4" />
+                    Post a trip
+                  </Link>
+                </Button>
+              }
+            />
+          ) : (
+            <div className="space-y-3">
+              {upcomingTrips.slice(0, 4).map((travel) => (
+                <Card key={travel._id}>
+                  <CardContent className="p-4">
+                    <div className="mb-2 flex items-center justify-between gap-3">
+                      <span className="text-sm font-medium">{travel.transportDetails?.carrier || 'Trip'}</span>
+                      <Badge variant={statusVariant(travel.status)}>{humanize(travel.status)}</Badge>
                     </div>
-                    <DialogFooter>
-                      {/* <Button type="submit">Save changes</Button> */}
-                      <Button
-                        // variant="outline"
-                        onClick={() => {
-                          toast({
-                            title: 'Flight logged! ',
-                            description: 'Community members can now see your flight plan.',
-                            action: <ToastAction altText="Nothing to do">Great</ToastAction>,
-                          });
-                        }}>
-                        Save changes
-                      </Button>
-                    </DialogFooter>
-                  </DialogContent>
-                </Dialog>
-              </CardDescription>
+                    <RouteLine
+                      from={travel.departureLocation?.city}
+                      to={travel.arrivalLocation?.city}
+                      subFrom={shortDate(travel.departureDate)}
+                      subTo={`${travel.availableCapacity?.weight}kg free`}
+                    />
+                  </CardContent>
+                </Card>
+              ))}
             </div>
-          </CardHeader>
+          )}
+        </section>
+      </div>
 
-          <CardContent>
-            Have some space for a little extra carry? Let the community know where you are going and take the chance to
-            grab a parcel.
-          </CardContent>
-        </Card>
-
-        <Card className=" w-[340px] -top-[15px] drop-shadow-xl shadow-black/10 dark:shadow-white/10">
-          <CardHeader className="flex flex-row items-center gap-4 pb-2">
-            <div className="flex flex-col">
-              <CardTitle className="text-lg">Need to Send?</CardTitle>
-
-              <CardDescription className="mt-4">
-                <Button
-                  className={`text-black ${buttonVariants({
-                    variant: 'outline',
-                  })}`}>
-                  <SearchCheckIcon className="mr-3" />
-                  Find a carrier
-                </Button>
-              </CardDescription>
-            </div>
-          </CardHeader>
-
-          <CardContent>
-            Have some space for a little extra carry? Let the community know where you are going and take the chance to
-            grab a parcel.
-          </CardContent>
-        </Card>
-
-        <Card className=" w-[340px] -top-[15px] drop-shadow-xl shadow-black/10 bg-gradient-to-r from-[#F596D3]  to-[#D247BF]">
-          <CardHeader className="flex flex-row items-center gap-4 pb-2">
-            <div className="flex flex-col">
-              <CardTitle className="text-lg"></CardTitle>
-
-              <CardDescription className="mt-4">
-                <Button
-                  className={`text-black ${buttonVariants({
-                    variant: 'outline',
-                  })}`}>
-                  Learn More
-                  <Lightbulb className="mr-3" />
-                </Button>
-              </CardDescription>
-            </div>
-          </CardHeader>
-
-          <CardContent>
-            Hesistant? Find out how parceflyte keeps everything secure and finds trusted members on this platform.
-          </CardContent>
-        </Card>
-      </section>
-
-      <h3 className="text-2xl font-bold my-8 mx-12">What you have been doing recently</h3>
-      <section className="history w-full mt-8 px-8 flex flex-row gap-x-8">
-        <Card className=" w-[340px] -top-[15px] drop-shadow-xl shadow-black/10 dark:shadow-white/10">
-          <CardHeader className="flex flex-row items-center gap-4 pb-2">
-            {/* <Avatar>
-              <AvatarFallback>SH</AvatarFallback>
-            </Avatar> */}
-
-            <div className="flex flex-col">
-              <CardTitle className="text-lg"></CardTitle>
-              <CardDescription></CardDescription>
-            </div>
-          </CardHeader>
-
-          <CardContent>This landig page is awesome!</CardContent>
-        </Card>
-      </section>
-
-      <h3 className="text-2xl font-bold my-8 mx-12">Community News</h3>
-    </>
+      {/* Discovery prompt */}
+      <Card className="mt-8 border-none bg-gradient-to-r from-[#F596D3]/15 to-[#D247BF]/15">
+        <CardHeader>
+          <CardTitle className="text-lg">Looking for a carrier?</CardTitle>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center justify-between gap-4">
+          <p className="max-w-md text-sm text-muted-foreground">
+            Browse everyone travelling in the next few weeks, or let the matching engine score them against a parcel you
+            have already listed.
+          </p>
+          <Button asChild>
+            <Link href="/browse">
+              <Search className="mr-2 h-4 w-4" />
+              Browse carriers
+            </Link>
+          </Button>
+        </CardContent>
+      </Card>
+    </AppShell>
   );
 }

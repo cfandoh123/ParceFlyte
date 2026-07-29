@@ -1,154 +1,129 @@
-import clientPromise from '@/lib/db';
-import { getAccessToken, withApiAuthRequired } from '@auth0/nextjs-auth0';
-import { NextResponse } from 'next/server';
+import { getDb, toId } from '@/lib/db';
+import { withAuth, currentUser } from '@/lib/auth';
+import { ok, badRequest, pagination, paginated, requireFields, positiveNumber, parseDate } from '@/lib/api';
+import { CITIES } from '@/lib/demo-data';
 
-export const GET = withApiAuthRequired(async function getParcels(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['read:parcels'],
-    });
+const CATEGORIES = ['electronics', 'clothing', 'documents', 'books', 'food', 'cosmetics', 'other'];
+const HANDLING = ['fragile', 'temperature_controlled', 'urgent', 'signature_required', 'photo_proof'];
 
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-    
-    // Get query parameters
-    const { searchParams } = new URL(req.url);
-    const senderId = searchParams.get('senderId');
-    const matchedCarrierId = searchParams.get('matchedCarrierId');
-    const status = searchParams.get('status');
-    const category = searchParams.get('category');
-    const minWeight = searchParams.get('minWeight');
-    const maxWeight = searchParams.get('maxWeight');
-    const minValue = searchParams.get('minValue');
-    const maxValue = searchParams.get('maxValue');
-    const deliveryDeadline = searchParams.get('deliveryDeadline');
-    const limit = parseInt(searchParams.get('limit')) || 20;
-    const page = parseInt(searchParams.get('page')) || 1;
-    const skip = (page - 1) * limit;
+function withCoordinates(place) {
+  if (!place?.city) return place;
+  const known = CITIES[place.city];
+  if (!known) return place;
+  return {
+    ...place,
+    country: place.country || known.country,
+    coordinates: place.coordinates || { latitude: known.lat, longitude: known.lon },
+  };
+}
 
-    // Build query
-    const query = {};
-    if (senderId) query.senderId = senderId;
-    if (matchedCarrierId) query.matchedCarrierId = matchedCarrierId;
-    if (status) query.status = status;
-    if (category) query.category = category;
-    if (minWeight) query.weight = { $gte: parseFloat(minWeight) };
-    if (maxWeight) {
-      if (query.weight) {
-        query.weight.$lte = parseFloat(maxWeight);
-      } else {
-        query.weight = { $lte: parseFloat(maxWeight) };
-      }
-    }
-    if (minValue) query.declaredValue = { $gte: parseFloat(minValue) };
-    if (maxValue) {
-      if (query.declaredValue) {
-        query.declaredValue.$lte = parseFloat(maxValue);
-      } else {
-        query.declaredValue = { $lte: parseFloat(maxValue) };
-      }
-    }
-    if (deliveryDeadline) {
-      const date = new Date(deliveryDeadline);
-      query.deliveryDeadline = { $lte: date };
-    }
+export const GET = withAuth(['read:parcels'], async (req) => {
+  const db = await getDb();
+  const { searchParams } = new URL(req.url);
+  const { page, limit, skip } = pagination(searchParams);
+  const get = (key) => searchParams.get(key);
 
-    const parcels = await db.collection('parcels')
-      .find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-
-    const total = await db.collection('parcels').countDocuments(query);
-
-    return NextResponse.json({
-      parcels,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  const query = {};
+  if (get('senderId')) query.senderId = toId(get('senderId'));
+  if (get('matchedCarrierId')) query.matchedCarrierId = toId(get('matchedCarrierId'));
+  if (get('status')) query.status = get('status');
+  if (get('category')) query.category = get('category');
+  if (get('minWeight') || get('maxWeight')) {
+    query.weight = {};
+    if (get('minWeight')) query.weight.$gte = parseFloat(get('minWeight'));
+    if (get('maxWeight')) query.weight.$lte = parseFloat(get('maxWeight'));
   }
+  if (get('minValue') || get('maxValue')) {
+    query.declaredValue = {};
+    if (get('minValue')) query.declaredValue.$gte = parseFloat(get('minValue'));
+    if (get('maxValue')) query.declaredValue.$lte = parseFloat(get('maxValue'));
+  }
+  if (get('deliveryDeadline')) query.deliveryDeadline = { $lte: new Date(get('deliveryDeadline')) };
+
+  const [parcels, total] = await Promise.all([
+    db.collection('parcels').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('parcels').countDocuments(query),
+  ]);
+
+  return ok(paginated(parcels, total, { page, limit }));
 });
 
-export const POST = withApiAuthRequired(async function createParcel(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:parcels'],
-    });
+export const POST = withAuth(['write:parcels'], async (req, { user }) => {
+  const db = await getDb();
+  const body = await req.json();
+  const profile = await currentUser(db, user);
 
-    const body = await req.json();
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
+  const missing = requireFields(body, [
+    'title',
+    'origin.city',
+    'recipient.name',
+    'recipient.address.city',
+    'weight',
+    'volume',
+    'declaredValue',
+    'deliveryDeadline',
+  ]);
+  if (missing) return missing;
 
-    // Validate required fields
-    const requiredFields = [
-      'senderId',
-      'recipient',
-      'description',
-      'category',
-      'dimensions',
-      'weight',
-      'declaredValue'
-    ];
-    
-    for (const field of requiredFields) {
-      if (!body[field]) {
-        return NextResponse.json({ error: `Missing required field: ${field}` }, { status: 400 });
-      }
-    }
+  const weight = positiveNumber(body.weight);
+  const volume = positiveNumber(body.volume);
+  const declaredValue = positiveNumber(body.declaredValue);
+  if (!weight) return badRequest('weight must be a positive number');
+  if (!volume) return badRequest('volume must be a positive number');
+  if (!declaredValue) return badRequest('declaredValue must be a positive number');
 
-    // Validate dimensions
-    if (body.dimensions.length <= 0 || body.dimensions.width <= 0 || body.dimensions.height <= 0) {
-      return NextResponse.json({ error: 'All dimensions must be greater than 0' }, { status: 400 });
-    }
+  const deadline = parseDate(body.deliveryDeadline);
+  if (!deadline) return badRequest('deliveryDeadline must be a valid date');
+  if (deadline < new Date()) return badRequest('deliveryDeadline cannot be in the past');
 
-    // Validate weight
-    if (body.weight <= 0) {
-      return NextResponse.json({ error: 'Weight must be greater than 0' }, { status: 400 });
-    }
-
-    // Validate declared value
-    if (body.declaredValue <= 0) {
-      return NextResponse.json({ error: 'Declared value must be greater than 0' }, { status: 400 });
-    }
-
-    // Calculate volume
-    const volume = body.dimensions.length * body.dimensions.width * body.dimensions.height;
-
-    // Create new parcel
-    const newParcel = {
-      ...body,
-      volume,
-      status: 'pending',
-      paymentStatus: 'pending',
-      agreedDeliveryFee: 0,
-      platformFee: 0,
-      totalAmount: 0,
-      trackingEvents: [{
-        event: 'created',
-        location: {
-          city: body.recipient.address?.city || '',
-          country: body.recipient.address?.country || '',
-        },
-        timestamp: new Date(),
-        description: 'Parcel created',
-      }],
-      messages: [],
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await db.collection('parcels').insertOne(newParcel);
-    newParcel._id = result.insertedId;
-
-    return NextResponse.json(newParcel, { status: 201 });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  const category = body.category || 'other';
+  if (!CATEGORIES.includes(category)) {
+    return badRequest(`category must be one of: ${CATEGORIES.join(', ')}`);
   }
-}); 
+
+  const specialHandling = Array.isArray(body.specialHandling) ? body.specialHandling : [];
+  const invalidHandling = specialHandling.filter((h) => !HANDLING.includes(h));
+  if (invalidHandling.length) {
+    return badRequest(`Unknown specialHandling: ${invalidHandling.join(', ')}`);
+  }
+
+  const origin = withCoordinates(body.origin);
+  const destination = withCoordinates(body.recipient.address);
+  if (origin.city === destination.city) {
+    return badRequest('Origin and destination cities must differ');
+  }
+
+  const now = new Date();
+  const newParcel = {
+    senderId: body.senderId ? toId(body.senderId) : profile?._id,
+    title: body.title,
+    description: body.description || '',
+    origin,
+    weight,
+    volume,
+    dimensions: body.dimensions || {},
+    declaredValue,
+    category,
+    specialHandling,
+    recipient: { ...body.recipient, address: destination },
+    deliveryDeadline: deadline,
+    preferredDeliveryTime: body.preferredDeliveryTime || 'anytime',
+    status: 'pending',
+    paymentStatus: 'pending',
+    insuranceRequired: Boolean(body.insuranceRequired),
+    insuranceAmount: body.insuranceRequired
+      ? positiveNumber(body.insuranceAmount) || Math.round(declaredValue * 0.02 * 100) / 100
+      : null,
+    trackingHistory: [{ status: 'created', timestamp: now, note: 'Parcel listed' }],
+    disputes: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  if (!newParcel.senderId) return badRequest('Could not resolve the sender for this parcel');
+
+  const result = await db.collection('parcels').insertOne(newParcel);
+  const created = await db.collection('parcels').findOne({ _id: toId(result.insertedId) });
+
+  return ok({ message: 'Parcel listed', parcel: created }, { status: 201 });
+});

@@ -1,157 +1,152 @@
-import clientPromise from '@/lib/db';
-import { getAccessToken, withApiAuthRequired } from '@auth0/nextjs-auth0';
-import { NextResponse } from 'next/server';
+import { getDb, toId, idString } from '@/lib/db';
+import { withAuth, currentUser } from '@/lib/auth';
+import { ok, badRequest, notFound, conflict, pagination, paginated, requireFields } from '@/lib/api';
 
-export const GET = withApiAuthRequired(async function getPayments(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['read:payments'],
-    });
+const METHODS = ['stripe', 'paypal', 'bank_transfer', 'crypto'];
 
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-    
-    // Get query parameters
-    const { searchParams } = new URL(req.url);
-    const parcelId = searchParams.get('parcelId');
-    const matchId = searchParams.get('matchId');
-    const senderId = searchParams.get('senderId');
-    const carrierId = searchParams.get('carrierId');
-    const status = searchParams.get('status');
-    const escrowStatus = searchParams.get('escrowStatus');
-    const minAmount = searchParams.get('minAmount');
-    const maxAmount = searchParams.get('maxAmount');
-    const limit = parseInt(searchParams.get('limit')) || 20;
-    const page = parseInt(searchParams.get('page')) || 1;
-    const skip = (page - 1) * limit;
+export const GET = withAuth(['read:payments'], async (req, { user }) => {
+  const db = await getDb();
+  const { searchParams } = new URL(req.url);
+  const { page, limit, skip } = pagination(searchParams);
+  const get = (key) => searchParams.get(key);
 
-    // Build query
-    const query = {};
-    if (parcelId) query.parcelId = parcelId;
-    if (matchId) query.matchId = matchId;
-    if (senderId) query.senderId = senderId;
-    if (carrierId) query.carrierId = carrierId;
-    if (status) query.status = status;
-    if (escrowStatus) query.escrowStatus = escrowStatus;
-    if (minAmount) query.amount = { $gte: parseFloat(minAmount) };
-    if (maxAmount) {
-      if (query.amount) {
-        query.amount.$lte = parseFloat(maxAmount);
-      } else {
-        query.amount = { $lte: parseFloat(maxAmount) };
-      }
-    }
-
-    const payments = await db.collection('payments')
-      .find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-
-    const total = await db.collection('payments').countDocuments(query);
-
-    return NextResponse.json({
-      payments,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  const query = {};
+  if (get('parcelId')) query.parcelId = toId(get('parcelId'));
+  if (get('matchId')) query.matchId = toId(get('matchId'));
+  if (get('senderId')) query.senderId = toId(get('senderId'));
+  if (get('carrierId')) query.carrierId = toId(get('carrierId'));
+  if (get('status')) query.status = get('status');
+  if (get('escrowStatus')) query.escrowStatus = get('escrowStatus');
+  if (get('minAmount') || get('maxAmount')) {
+    query.amount = {};
+    if (get('minAmount')) query.amount.$gte = parseFloat(get('minAmount'));
+    if (get('maxAmount')) query.amount.$lte = parseFloat(get('maxAmount'));
   }
+
+  if (get('mine') === 'true') {
+    const profile = await currentUser(db, user);
+    if (profile) query.$or = [{ senderId: profile._id }, { carrierId: profile._id }];
+  }
+
+  const [payments, total] = await Promise.all([
+    db.collection('payments').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('payments').countDocuments(query),
+  ]);
+
+  return ok(paginated(payments, total, { page, limit }));
 });
 
-export const POST = withApiAuthRequired(async function createPayment(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:payments'],
-    });
+/** Fund escrow for an accepted match. */
+export const POST = withAuth(['write:payments'], async (req) => {
+  const db = await getDb();
+  const body = await req.json();
 
-    const body = await req.json();
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
+  const missing = requireFields(body, ['matchId']);
+  if (missing) return missing;
 
-    // Validate required fields
-    const requiredFields = ['parcelId', 'matchId', 'senderId', 'carrierId', 'amount', 'paymentMethod'];
-    
-    for (const field of requiredFields) {
-      if (!body[field]) {
-        return NextResponse.json({ error: `Missing required field: ${field}` }, { status: 400 });
-      }
-    }
+  const match = await db.collection('matches').findOne({ _id: toId(body.matchId) });
+  if (!match) return notFound('Match not found');
+  if (match.status !== 'accepted') return badRequest('Only accepted matches can be paid for');
 
-    // Check if match exists and is accepted
-    const match = await db.collection('matches').findOne({ _id: body.matchId });
-    if (!match) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-    if (match.status !== 'accepted') {
-      return NextResponse.json({ error: 'Match must be accepted before creating payment' }, { status: 400 });
-    }
+  const existing = await db.collection('payments').findOne({ matchId: match._id });
+  if (existing) return conflict('This match already has a payment', { paymentId: existing._id });
 
-    // Check if payment already exists for this match
-    const existingPayment = await db.collection('payments').findOne({ matchId: body.matchId });
-    if (existingPayment) {
-      return NextResponse.json({ error: 'Payment already exists for this match' }, { status: 409 });
-    }
+  const paymentMethod = body.paymentMethod || 'stripe';
+  if (!METHODS.includes(paymentMethod)) {
+    return badRequest(`paymentMethod must be one of: ${METHODS.join(', ')}`);
+  }
 
-    // Generate unique payment ID
-    const paymentId = `PAY-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const amount = match.negotiation?.finalFee ?? match.negotiation?.initialFee;
+  if (!amount) return badRequest('This match has no agreed fee');
 
-    // Calculate fees
-    const deliveryFee = match.negotiation.finalFee || match.negotiation.initialFee;
-    const platformFee = deliveryFee * 0.05; // 5% platform fee
-    const insuranceFee = body.insuranceAmount || 0;
-    const totalAmount = deliveryFee + platformFee + insuranceFee;
+  const now = new Date();
+  const result = await db.collection('payments').insertOne({
+    matchId: match._id,
+    parcelId: match.parcelId,
+    senderId: match.senderId,
+    carrierId: match.carrierId,
+    amount,
+    currency: match.negotiation?.currency || 'USD',
+    paymentMethod,
+    status: 'completed',
+    escrowStatus: 'funded',
+    releaseCondition: 'delivery_confirmed',
+    disputes: [],
+    createdAt: now,
+    updatedAt: now,
+  });
 
-    // Create new payment
-    const newPayment = {
-      paymentId,
-      ...body,
-      deliveryFee,
-      platformFee,
-      insuranceFee,
-      totalAmount,
-      status: 'pending',
-      escrowStatus: 'funded',
-      escrowReleaseConditions: ['delivery_confirmed'],
-      dispute: {
-        isDisputed: false,
-      },
-      securityChecks: {
-        fraudScore: 0,
-        riskLevel: 'low',
-        flagged: false,
-      },
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
+  await db.collection('parcels').updateOne(
+    { _id: toId(match.parcelId) },
+    { $set: { paymentStatus: 'paid', updatedAt: now } }
+  );
 
-    const result = await db.collection('payments').insertOne(newPayment);
-    newPayment._id = result.insertedId;
+  const payment = await db.collection('payments').findOne({ _id: toId(result.insertedId) });
+  return ok({ message: 'Payment held in escrow', payment }, { status: 201 });
+});
 
-    // Update parcel status
-    await db.collection('parcels').updateOne(
-      { _id: body.parcelId },
-      { 
-        $set: { 
-          status: 'matched',
-          matchedCarrierId: body.carrierId,
-          agreedDeliveryFee: deliveryFee,
-          platformFee,
-          totalAmount,
-          paymentStatus: 'paid',
-          updatedAt: new Date()
-        }
+/** Release escrow to the carrier, or refund the sender. */
+export const PUT = withAuth(['write:payments'], async (req, { user }) => {
+  const db = await getDb();
+  const body = await req.json();
+
+  const missing = requireFields(body, ['paymentId', 'action']);
+  if (missing) return missing;
+
+  if (!['release', 'refund', 'dispute'].includes(body.action)) {
+    return badRequest('action must be one of: release, refund, dispute');
+  }
+
+  const payment = await db.collection('payments').findOne({ _id: toId(body.paymentId) });
+  if (!payment) return notFound('Payment not found');
+  if (payment.escrowStatus !== 'funded') {
+    return badRequest(`Escrow is already ${payment.escrowStatus}`);
+  }
+
+  const profile = await currentUser(db, user);
+  const now = new Date();
+
+  if (body.action === 'dispute') {
+    await db.collection('payments').updateOne(
+      { _id: payment._id },
+      {
+        $set: { escrowStatus: 'disputed', status: 'disputed', updatedAt: now },
+        $push: {
+          disputes: {
+            reason: body.reason || 'other',
+            description: body.description || '',
+            status: 'open',
+            priority: body.priority || 'medium',
+            raisedBy: profile?._id,
+            raisedAt: now,
+          },
+        },
       }
     );
-
-    return NextResponse.json(newPayment, { status: 201 });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+    return ok({ message: 'Dispute opened — an admin will review this payment' });
   }
-}); 
+
+  const isRelease = body.action === 'release';
+  await db.collection('payments').updateOne(
+    { _id: payment._id },
+    {
+      $set: {
+        escrowStatus: isRelease ? 'released' : 'refunded',
+        status: isRelease ? 'completed' : 'refunded',
+        [isRelease ? 'releasedAt' : 'refundedAt']: now,
+        updatedAt: now,
+      },
+    }
+  );
+
+  await db.collection('parcels').updateOne(
+    { _id: toId(payment.parcelId) },
+    { $set: { paymentStatus: isRelease ? 'released' : 'refunded', updatedAt: now } }
+  );
+
+  const updated = await db.collection('payments').findOne({ _id: payment._id });
+  return ok({
+    message: isRelease ? 'Escrow released to the carrier' : 'Payment refunded to the sender',
+    payment: updated,
+  });
+});

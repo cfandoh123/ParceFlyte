@@ -1,167 +1,119 @@
-import clientPromise from '@/lib/db';
-import { getAccessToken, withApiAuthRequired } from '@auth0/nextjs-auth0';
-import { NextResponse } from 'next/server';
+import { getDb, toId, idString } from '@/lib/db';
+import { withAuth, currentUser } from '@/lib/auth';
+import { ok, badRequest, notFound, conflict, pagination, paginated, requireFields } from '@/lib/api';
+import matchingService from '@/lib/matching-service';
+import { hydrateMatches, MATCH_TTL_DAYS } from '@/lib/matches';
 
-export const GET = withApiAuthRequired(async function getMatches(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['read:matches'],
-    });
+export const GET = withAuth(['read:matches'], async (req, { user }) => {
+  const db = await getDb();
+  const { searchParams } = new URL(req.url);
+  const { page, limit, skip } = pagination(searchParams);
+  const get = (key) => searchParams.get(key);
 
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-    
-    // Get query parameters
-    const { searchParams } = new URL(req.url);
-    const parcelId = searchParams.get('parcelId');
-    const travelId = searchParams.get('travelId');
-    const senderId = searchParams.get('senderId');
-    const carrierId = searchParams.get('carrierId');
-    const status = searchParams.get('status');
-    const minScore = searchParams.get('minScore');
-    const maxFee = searchParams.get('maxFee');
-    const limit = parseInt(searchParams.get('limit')) || 20;
-    const page = parseInt(searchParams.get('page')) || 1;
-    const skip = (page - 1) * limit;
+  const query = {};
+  if (get('parcelId')) query.parcelId = toId(get('parcelId'));
+  if (get('travelId')) query.travelId = toId(get('travelId'));
+  if (get('senderId')) query.senderId = toId(get('senderId'));
+  if (get('carrierId')) query.carrierId = toId(get('carrierId'));
+  if (get('status')) query.status = get('status');
+  if (get('minScore')) query.matchScore = { $gte: parseFloat(get('minScore')) };
 
-    // Build query
-    const query = {};
-    if (parcelId) query.parcelId = parcelId;
-    if (travelId) query.travelId = travelId;
-    if (senderId) query.senderId = senderId;
-    if (carrierId) query.carrierId = carrierId;
-    if (status) query.status = status;
-    if (minScore) query.matchScore = { $gte: parseFloat(minScore) };
-    if (maxFee) query['negotiation.finalFee'] = { $lte: parseFloat(maxFee) };
-
-    const matches = await db.collection('matches')
-      .find(query)
-      .sort({ matchScore: -1, createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-
-    const total = await db.collection('matches').countDocuments(query);
-
-    return NextResponse.json({
-      matches,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  // `mine=true` returns everything the caller is a party to, either side.
+  if (get('mine') === 'true') {
+    const profile = await currentUser(db, user);
+    if (profile) query.$or = [{ senderId: profile._id }, { carrierId: profile._id }];
   }
+
+  const [matches, total] = await Promise.all([
+    db.collection('matches').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('matches').countDocuments(query),
+  ]);
+
+  return ok(paginated(await hydrateMatches(db, matches), total, { page, limit }));
 });
 
-export const POST = withApiAuthRequired(async function createMatch(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:matches'],
-    });
+export const POST = withAuth(['write:matches'], async (req, { user }) => {
+  const db = await getDb();
+  const body = await req.json();
 
-    const body = await req.json();
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
+  const missing = requireFields(body, ['parcelId', 'travelId']);
+  if (missing) return missing;
 
-    // Validate required fields
-    const requiredFields = ['parcelId', 'travelId', 'senderId', 'carrierId', 'negotiation'];
-    
-    for (const field of requiredFields) {
-      if (!body[field]) {
-        return NextResponse.json({ error: `Missing required field: ${field}` }, { status: 400 });
-      }
-    }
+  const [parcel, travel] = await Promise.all([
+    db.collection('parcels').findOne({ _id: toId(body.parcelId) }),
+    db.collection('travels').findOne({ _id: toId(body.travelId) }),
+  ]);
+  if (!parcel) return notFound('Parcel not found');
+  if (!travel) return notFound('Travel not found');
 
-    // Check if parcel exists and is available
-    const parcel = await db.collection('parcels').findOne({ _id: body.parcelId });
-    if (!parcel) {
-      return NextResponse.json({ error: 'Parcel not found' }, { status: 404 });
-    }
-    if (parcel.status !== 'pending') {
-      return NextResponse.json({ error: 'Parcel is not available for matching' }, { status: 400 });
-    }
-
-    // Check if travel exists and is available
-    const travel = await db.collection('travels').findOne({ _id: body.travelId });
-    if (!travel) {
-      return NextResponse.json({ error: 'Travel not found' }, { status: 404 });
-    }
-    if (travel.status !== 'planned' && travel.status !== 'confirmed') {
-      return NextResponse.json({ error: 'Travel is not available for matching' }, { status: 400 });
-    }
-
-    // Check if there's already a match for this parcel and travel
-    const existingMatch = await db.collection('matches').findOne({
-      parcelId: body.parcelId,
-      travelId: body.travelId,
-      status: { $in: ['proposed', 'accepted'] }
-    });
-    if (existingMatch) {
-      return NextResponse.json({ error: 'Match already exists for this parcel and travel' }, { status: 409 });
-    }
-
-    // Calculate match score based on various factors
-    const matchScore = calculateMatchScore(parcel, travel);
-
-    // Set expiration date (24 hours from now)
-    const expiresAt = new Date();
-    expiresAt.setHours(expiresAt.getHours() + 24);
-
-    // Create new match
-    const newMatch = {
-      ...body,
-      status: 'proposed',
-      matchScore,
-      expiresAt,
-      proposedAt: new Date(),
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await db.collection('matches').insertOne(newMatch);
-    newMatch._id = result.insertedId;
-
-    return NextResponse.json(newMatch, { status: 201 });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  if (parcel.status !== 'pending') return badRequest('This parcel is no longer open for matching');
+  if (!['planned', 'confirmed'].includes(travel.status)) {
+    return badRequest('This travel is not accepting parcels');
   }
-});
+  if (idString(parcel.senderId) === idString(travel.carrierId)) {
+    return badRequest('You cannot carry your own parcel');
+  }
 
-// Helper function to calculate match score
-function calculateMatchScore(parcel, travel) {
-  let score = 0;
-  
-  // Route match (40 points)
-  const departureMatch = parcel.recipient.address?.city === travel.departureLocation.city &&
-                        parcel.recipient.address?.country === travel.departureLocation.country;
-  const arrivalMatch = parcel.recipient.address?.city === travel.arrivalLocation.city &&
-                      parcel.recipient.address?.country === travel.arrivalLocation.country;
-  
-  if (departureMatch) score += 20;
-  if (arrivalMatch) score += 20;
-  
-  // Capacity match (30 points)
-  const weightCapacity = travel.availableCapacity.weight >= parcel.weight;
-  const volumeCapacity = travel.availableCapacity.volume >= parcel.volume;
-  
-  if (weightCapacity) score += 15;
-  if (volumeCapacity) score += 15;
-  
-  // Timing match (20 points)
-  const deliveryDeadline = new Date(parcel.deliveryDeadline);
-  const travelArrival = new Date(travel.arrivalDate);
-  
-  if (deliveryDeadline >= travelArrival) score += 20;
-  
-  // Price match (10 points)
-  const baseFee = travel.baseDeliveryFee;
-  const maxFee = parcel.declaredValue * 0.1; // 10% of parcel value as max fee
-  
-  if (baseFee <= maxFee) score += 10;
-  
-  return Math.min(score, 100);
-} 
+  // Capacity must still be there at the moment of proposing.
+  if (travel.availableCapacity.weight < parcel.weight || travel.availableCapacity.volume < parcel.volume) {
+    return badRequest('This travel no longer has capacity for the parcel');
+  }
+
+  const existing = await db.collection('matches').findOne({
+    parcelId: parcel._id,
+    travelId: travel._id,
+    status: { $in: ['proposed', 'accepted'] },
+  });
+  if (existing) return conflict('A match already exists for this parcel and travel', { matchId: existing._id });
+
+  const profile = await currentUser(db, user);
+  const carrier = await db.collection('users').findOne({ _id: toId(travel.carrierId) });
+  const score = matchingService.calculateMatchScore(parcel, travel, carrier);
+  const pricing = matchingService.suggestPricing(parcel, travel);
+
+  const now = new Date();
+  const initialFee = body.proposedFee ?? matchingService.calculateEstimatedFee(parcel, travel);
+  const ceiling = matchingService.maxAcceptableFee(parcel);
+  if (initialFee > ceiling) {
+    return badRequest('Opening fee exceeds the 15%-of-declared-value cap for this parcel', {
+      maxAcceptableFee: ceiling,
+    });
+  }
+
+  const newMatch = {
+    parcelId: parcel._id,
+    travelId: travel._id,
+    senderId: parcel.senderId,
+    carrierId: travel.carrierId,
+    status: 'proposed',
+    matchScore: score,
+    proposedBy: profile?._id ?? parcel.senderId,
+    negotiation: {
+      initialFee,
+      proposedFee: null,
+      finalFee: null,
+      currency: travel.currency || 'USD',
+      suggestedRange: pricing.negotiationRange,
+      negotiationHistory: [],
+    },
+    agreement: {
+      pickupLocation: body.pickupLocation || `${travel.departureLocation.city}`,
+      pickupDate: travel.departureDate,
+      deliveryLocation: body.deliveryLocation || `${travel.arrivalLocation.city}`,
+      deliveryDate: travel.arrivalDate,
+      specialInstructions: body.specialInstructions || '',
+      insuranceRequired: Boolean(parcel.insuranceRequired),
+      insuranceAmount: parcel.insuranceAmount || null,
+    },
+    messages: [],
+    expiresAt: new Date(Math.min(now.getTime() + MATCH_TTL_DAYS * 86400000, new Date(travel.departureDate).getTime())),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const result = await db.collection('matches').insertOne(newMatch);
+  const created = await db.collection('matches').findOne({ _id: toId(result.insertedId) });
+  const [hydrated] = await hydrateMatches(db, [created]);
+
+  return ok({ message: 'Match proposed', match: hydrated }, { status: 201 });
+});

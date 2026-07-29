@@ -1,167 +1,129 @@
-import clientPromise from '@/lib/db';
-import { getAccessToken, withApiAuthRequired } from '@auth0/nextjs-auth0';
-import { NextResponse } from 'next/server';
+import { getDb, toId, idString } from '@/lib/db';
+import { withAuth, currentUser } from '@/lib/auth';
+import { ok, badRequest, notFound, conflict, forbidden, pagination, paginated, requireFields } from '@/lib/api';
 
-export const GET = withApiAuthRequired(async function getRatings(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['read:ratings'],
-    });
+const RATING_TYPES = ['sender_to_carrier', 'carrier_to_sender'];
 
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-    
-    // Get query parameters
-    const { searchParams } = new URL(req.url);
-    const parcelId = searchParams.get('parcelId');
-    const reviewerId = searchParams.get('reviewerId');
-    const reviewedId = searchParams.get('reviewedId');
-    const ratingType = searchParams.get('ratingType');
-    const status = searchParams.get('status');
-    const minRating = searchParams.get('minRating');
-    const maxRating = searchParams.get('maxRating');
-    const limit = parseInt(searchParams.get('limit')) || 20;
-    const page = parseInt(searchParams.get('page')) || 1;
-    const skip = (page - 1) * limit;
-
-    // Build query
-    const query = {};
-    if (parcelId) query.parcelId = parcelId;
-    if (reviewerId) query.reviewerId = reviewerId;
-    if (reviewedId) query.reviewedId = reviewedId;
-    if (ratingType) query.ratingType = ratingType;
-    if (status) query.status = status;
-    if (minRating) query.overallRating = { $gte: parseFloat(minRating) };
-    if (maxRating) {
-      if (query.overallRating) {
-        query.overallRating.$lte = parseFloat(maxRating);
-      } else {
-        query.overallRating = { $lte: parseFloat(maxRating) };
-      }
-    }
-
-    const ratings = await db.collection('ratings')
-      .find(query)
-      .sort({ publishedAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .toArray();
-
-    const total = await db.collection('ratings').countDocuments(query);
-
-    return NextResponse.json({
-      ratings,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
-  }
-});
-
-export const POST = withApiAuthRequired(async function createRating(req) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:ratings'],
-    });
-
-    const body = await req.json();
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-
-    // Validate required fields
-    const requiredFields = ['parcelId', 'reviewerId', 'reviewedId', 'overallRating', 'review'];
-    
-    for (const field of requiredFields) {
-      if (!body[field]) {
-        return NextResponse.json({ error: `Missing required field: ${field}` }, { status: 400 });
-      }
-    }
-
-    // Validate rating range
-    if (body.overallRating < 1 || body.overallRating > 5) {
-      return NextResponse.json({ error: 'Overall rating must be between 1 and 5' }, { status: 400 });
-    }
-
-    // Check if parcel exists and is delivered
-    const parcel = await db.collection('parcels').findOne({ _id: body.parcelId });
-    if (!parcel) {
-      return NextResponse.json({ error: 'Parcel not found' }, { status: 404 });
-    }
-    if (parcel.status !== 'delivered') {
-      return NextResponse.json({ error: 'Can only rate delivered parcels' }, { status: 400 });
-    }
-
-    // Check if user has already rated this parcel
-    const existingRating = await db.collection('ratings').findOne({
-      parcelId: body.parcelId,
-      reviewerId: body.reviewerId,
-      ratingType: body.ratingType
-    });
-    if (existingRating) {
-      return NextResponse.json({ error: 'You have already rated this parcel' }, { status: 409 });
-    }
-
-    // Generate unique rating ID
-    const ratingId = `RATE-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-
-    // Create new rating
-    const newRating = {
-      ratingId,
-      ...body,
-      status: 'published',
-      moderation: {
-        isFlagged: false,
-      },
-      helpfulVotes: {
-        helpful: 0,
-        notHelpful: 0,
-        voters: [],
-      },
-      publishedAt: new Date(),
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await db.collection('ratings').insertOne(newRating);
-    newRating._id = result.insertedId;
-
-    // Update user's average rating
-    await updateUserRating(db, body.reviewedId);
-
-    return NextResponse.json(newRating, { status: 201 });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
-  }
-});
-
-// Helper function to update user's average rating
-async function updateUserRating(db, userId) {
-  const ratings = await db.collection('ratings')
-    .find({ 
-      reviewedId: userId, 
-      status: 'published',
-      'moderation.isFlagged': false 
-    })
+/** Recompute a user's aggregate rating from their published reviews. */
+async function recomputeUserRating(db, userId) {
+  const reviews = await db
+    .collection('ratings')
+    .find({ reviewedId: toId(userId), status: 'published' })
     .toArray();
 
-  if (ratings.length > 0) {
-    const totalRating = ratings.reduce((sum, rating) => sum + rating.overallRating, 0);
-    const averageRating = totalRating / ratings.length;
+  const user = await db.collection('users').findOne({ _id: toId(userId) });
+  if (!user) return;
 
-    await db.collection('users').updateOne(
-      { _id: userId },
-      { 
-        $set: { 
-          'rating.average': averageRating,
-          'rating.totalReviews': ratings.length,
-          updatedAt: new Date()
-        }
-      }
-    );
+  const totalReviews = reviews.length;
+  const average = totalReviews
+    ? Math.round((reviews.reduce((sum, r) => sum + r.score, 0) / totalReviews) * 10) / 10
+    : 0;
+
+  await db.collection('users').updateOne(
+    { _id: user._id },
+    {
+      $set: {
+        'rating.average': average,
+        'rating.totalReviews': totalReviews,
+        updatedAt: new Date(),
+      },
+    }
+  );
+}
+
+export const GET = withAuth(['read:ratings'], async (req) => {
+  const db = await getDb();
+  const { searchParams } = new URL(req.url);
+  const { page, limit, skip } = pagination(searchParams);
+  const get = (key) => searchParams.get(key);
+
+  const query = { status: get('status') || 'published' };
+  if (get('parcelId')) query.parcelId = toId(get('parcelId'));
+  if (get('reviewerId')) query.reviewerId = toId(get('reviewerId'));
+  if (get('reviewedId')) query.reviewedId = toId(get('reviewedId'));
+  if (get('ratingType')) query.ratingType = get('ratingType');
+  if (get('minRating') || get('maxRating')) {
+    query.score = {};
+    if (get('minRating')) query.score.$gte = parseFloat(get('minRating'));
+    if (get('maxRating')) query.score.$lte = parseFloat(get('maxRating'));
   }
-} 
+
+  const [ratings, total] = await Promise.all([
+    db.collection('ratings').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('ratings').countDocuments(query),
+  ]);
+
+  // Attach reviewer identity so the UI can show who wrote each review.
+  const reviewerIds = [...new Set(ratings.map((r) => String(r.reviewerId)))];
+  const reviewers = reviewerIds.length
+    ? await db.collection('users').find({ _id: { $in: reviewerIds.map(toId) } }).toArray()
+    : [];
+  const reviewerMap = Object.fromEntries(
+    reviewers.map((u) => [
+      String(u._id),
+      { _id: u._id, firstName: u.firstName, lastName: u.lastName, avatarColor: u.avatarColor },
+    ])
+  );
+
+  const withReviewer = ratings.map((r) => ({ ...r, reviewer: reviewerMap[String(r.reviewerId)] || null }));
+  return ok(paginated(withReviewer, total, { page, limit }));
+});
+
+export const POST = withAuth(['write:ratings'], async (req, { user }) => {
+  const db = await getDb();
+  const body = await req.json();
+
+  const missing = requireFields(body, ['parcelId', 'score']);
+  if (missing) return missing;
+
+  const score = Number(body.score);
+  if (!Number.isFinite(score) || score < 1 || score > 5) {
+    return badRequest('score must be a number between 1 and 5');
+  }
+
+  const parcel = await db.collection('parcels').findOne({ _id: toId(body.parcelId) });
+  if (!parcel) return notFound('Parcel not found');
+  if (parcel.status !== 'delivered') {
+    return badRequest('You can only review a delivery once the parcel has been delivered');
+  }
+
+  const profile = await currentUser(db, user);
+  const isSender = idString(parcel.senderId) === idString(profile?._id);
+  const isCarrier = idString(parcel.matchedCarrierId) === idString(profile?._id);
+  if (!isSender && !isCarrier) return forbidden('Only the sender or carrier can review this delivery');
+
+  const ratingType = isSender ? 'sender_to_carrier' : 'carrier_to_sender';
+  if (body.ratingType && !RATING_TYPES.includes(body.ratingType)) {
+    return badRequest(`ratingType must be one of: ${RATING_TYPES.join(', ')}`);
+  }
+
+  const reviewedId = isSender ? parcel.matchedCarrierId : parcel.senderId;
+  if (!reviewedId) return badRequest('This parcel has no counterparty to review');
+
+  const existing = await db.collection('ratings').findOne({
+    parcelId: parcel._id,
+    reviewerId: profile._id,
+    ratingType,
+  });
+  if (existing) return conflict('You have already reviewed this delivery');
+
+  const now = new Date();
+  const result = await db.collection('ratings').insertOne({
+    parcelId: parcel._id,
+    reviewerId: profile._id,
+    reviewedId,
+    ratingType,
+    score,
+    review: body.review || '',
+    status: 'published',
+    flags: [],
+    helpfulness: [],
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  await recomputeUserRating(db, reviewedId);
+
+  const rating = await db.collection('ratings').findOne({ _id: toId(result.insertedId) });
+  return ok({ message: 'Review published', rating }, { status: 201 });
+});

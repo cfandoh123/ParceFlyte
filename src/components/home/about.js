@@ -18,9 +18,14 @@ export const About = () => {
                 Parceflyte
               </h2>
               <p className="text-xl text-muted-foreground mt-4">
-                Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et
-                dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip
-                ex ea commodo consequat. Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+                Millions of people fly every day with half-empty luggage allowances, while parcels sit waiting for
+                couriers that are slow, expensive, or simply do not serve the route. ParceFlyte closes that gap.
+              </p>
+              <p className="text-xl text-muted-foreground mt-4">
+                Senders list what they need delivered. Travellers share the trip they were already taking. Our matching
+                engine scores every possible pairing on route, capacity, timing, price and reputation, so both sides can
+                see exactly why a match was suggested. Identity checks, a negotiated fee and escrowed payment do the
+                rest.
               </p>
             </div>
 

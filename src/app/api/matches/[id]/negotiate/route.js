@@ -1,119 +1,88 @@
-import clientPromise from '@/lib/db';
-import { getAccessToken, withApiAuthRequired } from '@auth0/nextjs-auth0';
-import { NextResponse } from 'next/server';
-import { ObjectId } from 'mongodb';
+import { getDb, toId, idString } from '@/lib/db';
+import { withAuth, currentUser } from '@/lib/auth';
+import { ok, notFound, forbidden, badRequest, requireFields, positiveNumber } from '@/lib/api';
+import matchingService from '@/lib/matching-service';
 
-export const POST = withApiAuthRequired(async function negotiateMatch(req, { params }) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['write:matches'],
-    });
+/** Append a counter-offer to a match's negotiation thread. */
+export const POST = withAuth(['write:matches'], async (req, { params, user }) => {
+  const db = await getDb();
+  const match = await db.collection('matches').findOne({ _id: toId(params.id) });
+  if (!match) return notFound('Match not found');
 
-    const { id } = params;
-    const body = await req.json();
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
-
-    // Validate required fields
-    if (!body.proposedFee || !body.proposedBy) {
-      return NextResponse.json({ error: 'Proposed fee and proposer are required' }, { status: 400 });
-    }
-
-    // Get match details
-    const match = await db.collection('matches').findOne({ _id: new ObjectId(id) });
-    if (!match) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    if (match.status !== 'proposed') {
-      return NextResponse.json({ error: 'Match is not in proposed status' }, { status: 400 });
-    }
-
-    // Check if match has expired
-    if (new Date() > new Date(match.expiresAt)) {
-      return NextResponse.json({ error: 'Match has expired' }, { status: 400 });
-    }
-
-    // Validate proposer is either sender or carrier
-    if (body.proposedBy !== match.senderId && body.proposedBy !== match.carrierId) {
-      return NextResponse.json({ error: 'Invalid proposer' }, { status: 400 });
-    }
-
-    // Get parcel details for validation
-    const parcel = await db.collection('parcels').findOne({ _id: match.parcelId });
-    if (!parcel) {
-      return NextResponse.json({ error: 'Parcel not found' }, { status: 404 });
-    }
-
-    // Validate proposed fee
-    const maxAcceptableFee = parcel.declaredValue * 0.15; // 15% of parcel value
-    if (body.proposedFee > maxAcceptableFee) {
-      return NextResponse.json({ 
-        error: 'Proposed fee exceeds maximum acceptable fee',
-        maxAcceptableFee 
-      }, { status: 400 });
-    }
-
-    // Add negotiation history entry
-    const negotiationEntry = {
-      proposedBy: body.proposedBy,
-      amount: body.proposedFee,
-      message: body.message || '',
-      timestamp: new Date(),
-    };
-
-    // Update match with new negotiation
-    const updateData = {
-      'negotiation.proposedFee': body.proposedFee,
-      'negotiation.negotiationHistory': [
-        ...(match.negotiation?.negotiationHistory || []),
-        negotiationEntry
-      ],
-      updatedAt: new Date(),
-    };
-
-    const result = await db.collection('matches').updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updateData }
-    );
-
-    if (result.matchedCount === 0) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    // Get updated match
-    const updatedMatch = await db.collection('matches').findOne({ _id: new ObjectId(id) });
-
-    return NextResponse.json({
-      message: 'Negotiation proposal added successfully',
-      match: updatedMatch,
-      negotiationEntry,
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
+  if (match.status !== 'proposed') {
+    return badRequest(`This match is ${match.status} and can no longer be negotiated`);
   }
+  if (new Date() > new Date(match.expiresAt)) {
+    return badRequest('This match has expired');
+  }
+
+  const body = await req.json();
+  const missing = requireFields(body, ['proposedFee']);
+  if (missing) return missing;
+
+  const proposedFee = positiveNumber(body.proposedFee);
+  if (!proposedFee) return badRequest('proposedFee must be a positive number');
+
+  // The proposer is the caller — never taken from the request body, which would
+  // let anyone post offers as the other party.
+  const profile = await currentUser(db, user);
+  const proposerId = profile?._id;
+  const isSender = idString(match.senderId) === idString(proposerId);
+  const isCarrier = idString(match.carrierId) === idString(proposerId);
+  if (!isSender && !isCarrier) return forbidden('Only the sender or carrier can negotiate this match');
+
+  const parcel = await db.collection('parcels').findOne({ _id: toId(match.parcelId) });
+  if (!parcel) return notFound('Parcel not found');
+
+  const maxAcceptableFee = matchingService.maxAcceptableFee(parcel);
+  if (proposedFee > maxAcceptableFee) {
+    return badRequest('Proposed fee exceeds the maximum acceptable fee for this parcel', { maxAcceptableFee });
+  }
+
+  const history = match.negotiation?.negotiationHistory || [];
+  const last = history[history.length - 1];
+  if (last && idString(last.proposedBy) === idString(proposerId)) {
+    return badRequest('You already have an offer on the table — wait for a response');
+  }
+
+  const now = new Date();
+  const entry = {
+    proposedBy: proposerId,
+    proposedByRole: isSender ? 'sender' : 'carrier',
+    amount: proposedFee,
+    message: body.message || '',
+    timestamp: now,
+  };
+
+  await db.collection('matches').updateOne(
+    { _id: match._id },
+    {
+      $set: { 'negotiation.proposedFee': proposedFee, updatedAt: now },
+      $push: { 'negotiation.negotiationHistory': entry },
+    }
+  );
+
+  const updated = await db.collection('matches').findOne({ _id: match._id });
+  return ok({ message: 'Counter-offer sent', match: updated, negotiationEntry: entry });
 });
 
-export const GET = withApiAuthRequired(async function getNegotiationHistory(req, { params }) {
-  try {
-    const { accessToken } = await getAccessToken(req, {
-      scopes: ['read:matches'],
-    });
+/** The full negotiation thread, plus the band the engine recommends. */
+export const GET = withAuth(['read:matches'], async (req, { params }) => {
+  const db = await getDb();
+  const match = await db.collection('matches').findOne({ _id: toId(params.id) });
+  if (!match) return notFound('Match not found');
 
-    const { id } = params;
-    const client = await clientPromise;
-    const db = client.db('parceflyte');
+  const [parcel, travel] = await Promise.all([
+    db.collection('parcels').findOne({ _id: toId(match.parcelId) }),
+    db.collection('travels').findOne({ _id: toId(match.travelId) }),
+  ]);
 
-    const match = await db.collection('matches').findOne({ _id: new ObjectId(id) });
-    if (!match) {
-      return NextResponse.json({ error: 'Match not found' }, { status: 404 });
-    }
-
-    return NextResponse.json({
-      negotiation: match.negotiation,
-      history: match.negotiation?.negotiationHistory || [],
-    });
-  } catch (error) {
-    return NextResponse.json({ error: error.message }, { status: error.status || 500 });
-  }
-}); 
+  return ok({
+    matchId: match._id,
+    status: match.status,
+    expiresAt: match.expiresAt,
+    negotiation: match.negotiation,
+    pricing: parcel && travel ? matchingService.suggestPricing(parcel, travel) : null,
+    maxAcceptableFee: parcel ? matchingService.maxAcceptableFee(parcel) : null,
+  });
+});

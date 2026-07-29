@@ -1,24 +1,25 @@
 import { Toaster } from '@/components/ui/toaster';
-import { UserProvider } from '@auth0/nextjs-auth0/client';
+import { SessionProvider } from '@/components/session-provider';
 import { Inter } from 'next/font/google';
 import './globals.css';
 
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata = {
-  title: 'Parceflyte',
+  title: 'ParceFlyte — peer-to-peer parcel delivery',
   description:
-    'Parceflyte is a secure online platform that facilitates peer-to-peer delivery of parcels and packages over long distances by leveraging the travel plans of its user community.',
+    'ParceFlyte connects senders with verified travellers who have spare luggage capacity, with intelligent matching, fee negotiation and escrowed payments.',
 };
 
 export default function RootLayout({ children }) {
   return (
     <html lang="en">
-      <UserProvider>
-        <body className={inter.className}>{children}</body>
-        <Toaster />
-        <time dateTime="2024-10-25" suppressHydrationWarning />
-      </UserProvider>
+      <body className={inter.className}>
+        <SessionProvider>
+          {children}
+          <Toaster />
+        </SessionProvider>
+      </body>
     </html>
   );
 }
