@@ -1,10 +1,10 @@
 import { getDb, toId, idString } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAuth } from '@/lib/auth';
 import { ok, notFound, forbidden, badRequest, requireFields, positiveNumber } from '@/lib/api';
 import matchingService from '@/lib/matching-service';
 
 /** Append a counter-offer to a match's negotiation thread. */
-export const POST = withAuth(['write:matches'], async (req, { params, user }) => {
+export const POST = withAuth(async (req, { params, profile }) => {
   const db = await getDb();
   const match = await db.collection('matches').findOne({ _id: toId(params.id) });
   if (!match) return notFound('Match not found');
@@ -25,7 +25,6 @@ export const POST = withAuth(['write:matches'], async (req, { params, user }) =>
 
   // The proposer is the caller — never taken from the request body, which would
   // let anyone post offers as the other party.
-  const profile = await currentUser(db, user);
   const proposerId = profile?._id;
   const isSender = idString(match.senderId) === idString(proposerId);
   const isCarrier = idString(match.carrierId) === idString(proposerId);
@@ -67,10 +66,15 @@ export const POST = withAuth(['write:matches'], async (req, { params, user }) =>
 });
 
 /** The full negotiation thread, plus the band the engine recommends. */
-export const GET = withAuth(['read:matches'], async (req, { params }) => {
+export const GET = withAuth(async (req, { params, profile }) => {
   const db = await getDb();
   const match = await db.collection('matches').findOne({ _id: toId(params.id) });
   if (!match) return notFound('Match not found');
+
+  const me = idString(profile._id);
+  if (idString(match.senderId) !== me && idString(match.carrierId) !== me) {
+    return forbidden('Only the sender or carrier can see this negotiation');
+  }
 
   const [parcel, travel] = await Promise.all([
     db.collection('parcels').findOne({ _id: toId(match.parcelId) }),

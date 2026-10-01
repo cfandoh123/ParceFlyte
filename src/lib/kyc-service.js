@@ -145,6 +145,19 @@ export function canAutoApprove({ riskAssessment, compliance, documentVerificatio
   );
 }
 
+/**
+ * Load a KYC application the caller is entitled to: their own, or — for an
+ * admin — any by its reference. Someone else's reference resolves to nothing.
+ */
+export async function loadApplication(db, profile, kycId) {
+  if (!kycId) return db.collection('kyc').findOne({ userId: profile._id });
+
+  const application = await db.collection('kyc').findOne({ kycId });
+  if (!application) return null;
+  const isOwner = String(application.userId) === String(profile._id);
+  return isOwner || profile.roles?.includes('admin') ? application : null;
+}
+
 /** Sequential, human-readable KYC reference. */
 export function nextKycId(count) {
   return `KYC-${new Date().getFullYear()}-${String(count + 1).padStart(4, '0')}`;

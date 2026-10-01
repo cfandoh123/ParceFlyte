@@ -1,5 +1,5 @@
 import { getDb, toId, idString } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAuth, isAdmin } from '@/lib/auth';
 import { ok, badRequest, notFound, conflict, forbidden, pagination, paginated, requireFields } from '@/lib/api';
 
 const RATING_TYPES = ['sender_to_carrier', 'carrier_to_sender'];
@@ -31,13 +31,14 @@ async function recomputeUserRating(db, userId) {
   );
 }
 
-export const GET = withAuth(['read:ratings'], async (req) => {
+export const GET = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const { searchParams } = new URL(req.url);
   const { page, limit, skip } = pagination(searchParams);
   const get = (key) => searchParams.get(key);
 
-  const query = { status: get('status') || 'published' };
+  // Hidden and flagged reviews are for moderators.
+  const query = { status: isAdmin(profile) && get('status') ? get('status') : 'published' };
   if (get('parcelId')) query.parcelId = toId(get('parcelId'));
   if (get('reviewerId')) query.reviewerId = toId(get('reviewerId'));
   if (get('reviewedId')) query.reviewedId = toId(get('reviewedId'));
@@ -69,7 +70,7 @@ export const GET = withAuth(['read:ratings'], async (req) => {
   return ok(paginated(withReviewer, total, { page, limit }));
 });
 
-export const POST = withAuth(['write:ratings'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const body = await req.json();
 
@@ -87,7 +88,6 @@ export const POST = withAuth(['write:ratings'], async (req, { user }) => {
     return badRequest('You can only review a delivery once the parcel has been delivered');
   }
 
-  const profile = await currentUser(db, user);
   const isSender = idString(parcel.senderId) === idString(profile?._id);
   const isCarrier = idString(parcel.matchedCarrierId) === idString(profile?._id);
   if (!isSender && !isCarrier) return forbidden('Only the sender or carrier can review this delivery');

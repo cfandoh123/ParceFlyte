@@ -1,23 +1,21 @@
 import { getDb, toId } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAuth } from '@/lib/auth';
 import { ok, badRequest, notFound } from '@/lib/api';
-import { assessRisk, runComplianceChecks, verifyDocuments, canAutoApprove } from '@/lib/kyc-service';
-
-async function loadApplication(db, profile, kycId) {
-  return kycId
-    ? db.collection('kyc').findOne({ kycId })
-    : db.collection('kyc').findOne({ userId: profile._id });
-}
+import {
+  assessRisk,
+  runComplianceChecks,
+  verifyDocuments,
+  canAutoApprove,
+  loadApplication,
+} from '@/lib/kyc-service';
 
 /**
  * Run the automated verification pass: risk scoring, compliance screening and
  * document checks. Clean applications are approved automatically; anything
  * flagged is routed to the admin review queue.
  */
-export const POST = withAuth(['write:users'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
-  const profile = await currentUser(db, user);
-  if (!profile) return notFound('User not found');
 
   const body = await req.json().catch(() => ({}));
   const application = await loadApplication(db, profile, body.kycId);
@@ -90,10 +88,8 @@ export const POST = withAuth(['write:users'], async (req, { user }) => {
 });
 
 /** Current verification status and results. */
-export const GET = withAuth(['read:users'], async (req, { user }) => {
+export const GET = withAuth(async (req, { profile }) => {
   const db = await getDb();
-  const profile = await currentUser(db, user);
-  if (!profile) return notFound('User not found');
 
   const { searchParams } = new URL(req.url);
   const application = await loadApplication(db, profile, searchParams.get('kycId'));

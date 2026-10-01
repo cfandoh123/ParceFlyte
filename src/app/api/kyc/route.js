@@ -1,29 +1,23 @@
 import { getDb, toId } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAuth } from '@/lib/auth';
 import { ok, badRequest, notFound, conflict, requireFields } from '@/lib/api';
-import { assessRisk, nextKycId } from '@/lib/kyc-service';
+import { assessRisk, nextKycId, loadApplication } from '@/lib/kyc-service';
 
 /** The caller's own KYC application, if they have one. */
-export const GET = withAuth(['read:users'], async (req, { user }) => {
+export const GET = withAuth(async (req, { profile }) => {
   const db = await getDb();
-  const profile = await currentUser(db, user);
-  if (!profile) return notFound('User not found');
 
   const { searchParams } = new URL(req.url);
   const kycId = searchParams.get('kycId');
 
-  const application = kycId
-    ? await db.collection('kyc').findOne({ kycId })
-    : await db.collection('kyc').findOne({ userId: profile._id });
+  const application = await loadApplication(db, profile, kycId);
 
   return ok({ kyc: application || null, kycStatus: profile.kycStatus });
 });
 
 /** Submit a new KYC application. */
-export const POST = withAuth(['write:users'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
-  const profile = await currentUser(db, user);
-  if (!profile) return notFound('User not found');
 
   const body = await req.json();
   const missing = requireFields(body, [
@@ -82,15 +76,11 @@ export const POST = withAuth(['write:users'], async (req, { user }) => {
 });
 
 /** Update an application that has not been approved yet. */
-export const PUT = withAuth(['write:users'], async (req, { user }) => {
+export const PUT = withAuth(async (req, { profile }) => {
   const db = await getDb();
-  const profile = await currentUser(db, user);
-  if (!profile) return notFound('User not found');
 
   const body = await req.json();
-  const application = body.kycId
-    ? await db.collection('kyc').findOne({ kycId: body.kycId })
-    : await db.collection('kyc').findOne({ userId: profile._id });
+  const application = await loadApplication(db, profile, body.kycId);
 
   if (!application) return notFound('KYC application not found');
   if (application.verificationProcess?.status === 'approved') {

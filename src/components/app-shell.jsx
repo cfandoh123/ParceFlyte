@@ -3,7 +3,7 @@
 import Link from 'next/link';
 import Image from 'next/image';
 import { usePathname } from 'next/navigation';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   LayoutDashboard,
   Package,
@@ -15,6 +15,8 @@ import {
   X,
   RotateCcw,
   ClipboardCheck,
+  LogOut,
+  Loader2,
 } from 'lucide-react';
 
 import Logo from '@/assets/images/logo.png';
@@ -95,10 +97,48 @@ function DemoBanner() {
 /** Sidebar + header chrome for every signed-in page. */
 export function AppShell({ children, title, description, actions }) {
   const pathname = usePathname();
-  const { user, loading } = useSession();
+  const { user, loading, authEnabled, error } = useSession();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const isAdmin = user?.roles?.includes('admin');
+  const signedOut = !loading && !user;
+
+  // Signed-out visitors go to sign-in and come back to the page they wanted.
+  useEffect(() => {
+    if (signedOut && authEnabled) {
+      window.location.href = `/api/auth/login?returnTo=${encodeURIComponent(pathname)}`;
+    }
+  }, [signedOut, authEnabled, pathname]);
+
+  if (signedOut) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center gap-3 p-6 text-center">
+        {authEnabled ? (
+          <>
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+            <p className="text-sm text-muted-foreground">Taking you to sign in…</p>
+          </>
+        ) : (
+          <>
+            <p className="font-medium">ParceFlyte could not load your session</p>
+            <p className="max-w-sm text-sm text-muted-foreground">{error || 'Please try again in a moment.'}</p>
+            <a href="/api/auth/logout" className="text-sm font-medium underline underline-offset-4">
+              Sign out
+            </a>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  const signOut = authEnabled && (
+    <a
+      href="/api/auth/logout"
+      className="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground">
+      <LogOut className="h-4 w-4 shrink-0" />
+      Sign out
+    </a>
+  );
 
   const navLink = ({ href, label, icon: Icon }) => {
     const active = pathname === href || pathname.startsWith(`${href}/`);
@@ -164,6 +204,7 @@ export function AppShell({ children, title, description, actions }) {
                 </Badge>
               </Link>
             )}
+            {signOut && <div className="mt-3">{signOut}</div>}
           </div>
         </aside>
 
@@ -183,7 +224,10 @@ export function AppShell({ children, title, description, actions }) {
           </header>
 
           {mobileOpen && (
-            <div className="border-b bg-background p-4 lg:hidden">{nav}</div>
+            <div className="border-b bg-background p-4 lg:hidden">
+              {nav}
+              {signOut && <div className="mt-1">{signOut}</div>}
+            </div>
           )}
 
           <main className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 lg:py-8">

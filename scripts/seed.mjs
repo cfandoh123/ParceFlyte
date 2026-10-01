@@ -45,44 +45,35 @@ function toObjectIds(value) {
   return value;
 }
 
-const INDEXES = {
-  users: [
-    [{ auth0Id: 1 }, { unique: true }],
-    [{ email: 1 }, { unique: true }],
-    [{ roles: 1, kycStatus: 1 }],
-  ],
-  travels: [
-    [{ status: 1, departureDate: 1 }],
-    [{ 'departureLocation.city': 1, 'arrivalLocation.city': 1 }],
-    [{ carrierId: 1 }],
-  ],
-  parcels: [[{ senderId: 1, status: 1 }], [{ deliveryDeadline: 1 }], [{ matchedCarrierId: 1 }]],
-  matches: [[{ parcelId: 1, travelId: 1 }], [{ senderId: 1, status: 1 }], [{ carrierId: 1, status: 1 }]],
-  payments: [[{ matchId: 1 }, { unique: true }], [{ escrowStatus: 1 }]],
-  ratings: [[{ reviewedId: 1, status: 1 }], [{ parcelId: 1, reviewerId: 1, ratingType: 1 }, { unique: true }]],
-  kyc: [[{ userId: 1 }], [{ kycId: 1 }, { unique: true }], [{ 'verificationProcess.status': 1 }]],
-};
+const { INDEXES, ensureIndexes } = await import('../src/lib/indexes.js');
+
+// `--indexes-only` prepares an empty database for real users: no demo data.
+const indexesOnly = process.argv.includes('--indexes-only');
 
 const client = new MongoClient(uri);
 await client.connect();
 const db = client.db('parceflyte');
 
-const data = buildSeedData();
+if (!indexesOnly) {
+  const data = buildSeedData();
 
-for (const [name, documents] of Object.entries(data)) {
-  const collection = db.collection(name);
-  await collection.deleteMany({});
-  if (documents.length) await collection.insertMany(documents.map(toObjectIds));
-  console.log(`  ${name.padEnd(9)} ${String(documents.length).padStart(3)} documents`);
+  for (const [name, documents] of Object.entries(data)) {
+    const collection = db.collection(name);
+    await collection.deleteMany({});
+    if (documents.length) await collection.insertMany(documents.map(toObjectIds));
+    console.log(`  ${name.padEnd(9)} ${String(documents.length).padStart(3)} documents`);
+  }
 }
 
 console.log('\nCreating indexes…');
+await ensureIndexes(db);
 for (const [name, specs] of Object.entries(INDEXES)) {
-  for (const [keys, options] of specs) {
-    await db.collection(name).createIndex(keys, options || {});
-  }
   console.log(`  ${name.padEnd(9)} ${specs.length} indexes`);
 }
 
 await client.close();
-console.log('\nSeeded. Start the app with the same MONGODB_URI to run against it.');
+console.log(
+  indexesOnly
+    ? '\nIndexes created. The database is ready for real sign-ins.'
+    : '\nSeeded. Start the app with the same MONGODB_URI to run against it.'
+);
