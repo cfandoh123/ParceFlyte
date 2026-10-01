@@ -1,5 +1,5 @@
 import { getDb, toId } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAuth, restrictToParty } from '@/lib/auth';
 import { ok, badRequest, pagination, paginated, requireFields, positiveNumber, parseDate } from '@/lib/api';
 import { CITIES } from '@/lib/demo-data';
 
@@ -17,7 +17,7 @@ function withCoordinates(place) {
   };
 }
 
-export const GET = withAuth(['read:parcels'], async (req) => {
+export const GET = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const { searchParams } = new URL(req.url);
   const { page, limit, skip } = pagination(searchParams);
@@ -40,18 +40,21 @@ export const GET = withAuth(['read:parcels'], async (req) => {
   }
   if (get('deliveryDeadline')) query.deliveryDeadline = { $lte: new Date(get('deliveryDeadline')) };
 
+  // Parcels carry the recipient's name and address, so a list only ever
+  // contains parcels the caller sent or is carrying.
+  const scoped = restrictToParty(query, profile, ['senderId', 'matchedCarrierId']);
+
   const [parcels, total] = await Promise.all([
-    db.collection('parcels').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-    db.collection('parcels').countDocuments(query),
+    db.collection('parcels').find(scoped).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('parcels').countDocuments(scoped),
   ]);
 
   return ok(paginated(parcels, total, { page, limit }));
 });
 
-export const POST = withAuth(['write:parcels'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const body = await req.json();
-  const profile = await currentUser(db, user);
 
   const missing = requireFields(body, [
     'title',
@@ -95,7 +98,7 @@ export const POST = withAuth(['write:parcels'], async (req, { user }) => {
 
   const now = new Date();
   const newParcel = {
-    senderId: body.senderId ? toId(body.senderId) : profile?._id,
+    senderId: profile._id,
     title: body.title,
     description: body.description || '',
     origin,
@@ -119,8 +122,6 @@ export const POST = withAuth(['write:parcels'], async (req, { user }) => {
     createdAt: now,
     updatedAt: now,
   };
-
-  if (!newParcel.senderId) return badRequest('Could not resolve the sender for this parcel');
 
   const result = await db.collection('parcels').insertOne(newParcel);
   const created = await db.collection('parcels').findOne({ _id: toId(result.insertedId) });

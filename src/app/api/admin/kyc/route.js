@@ -1,5 +1,5 @@
 import { getDb, toId } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAdmin } from '@/lib/auth';
 import { ok, badRequest, notFound, pagination, paginated, requireFields } from '@/lib/api';
 import { riskLevel } from '@/lib/kyc-service';
 
@@ -9,7 +9,7 @@ import { riskLevel } from '@/lib/kyc-service';
  * `?status=statistics` returns the dashboard counters; otherwise this is a
  * paginated review queue, ordered so the riskiest applications surface first.
  */
-export const GET = withAuth(['read:users'], async (req) => {
+export const GET = withAdmin(async (req) => {
   const db = await getDb();
   const { searchParams } = new URL(req.url);
 
@@ -82,7 +82,7 @@ export const GET = withAuth(['read:users'], async (req) => {
 });
 
 /** Record an admin decision on an application. */
-export const POST = withAuth(['write:users'], async (req, { user }) => {
+export const POST = withAdmin(async (req, { profile: reviewer }) => {
   const db = await getDb();
   const body = await req.json();
 
@@ -103,7 +103,6 @@ export const POST = withAuth(['write:users'], async (req, { user }) => {
     return badRequest('This application is already approved');
   }
 
-  const reviewer = await currentUser(db, user);
   const status = decisions[body.decision];
   const now = new Date();
 
@@ -147,7 +146,7 @@ export const POST = withAuth(['write:users'], async (req, { user }) => {
 });
 
 /** Manually override an application's risk assessment. */
-export const PUT = withAuth(['write:users'], async (req, { user }) => {
+export const PUT = withAdmin(async (req, { profile: reviewer }) => {
   const db = await getDb();
   const body = await req.json();
 
@@ -162,7 +161,6 @@ export const PUT = withAuth(['write:users'], async (req, { user }) => {
   const application = await db.collection('kyc').findOne({ kycId: body.kycId });
   if (!application) return notFound('KYC application not found');
 
-  const reviewer = await currentUser(db, user);
   const now = new Date();
 
   await db.collection('kyc').updateOne(

@@ -1,47 +1,67 @@
-import { getDb, toId } from '@/lib/db';
-import { withAuth } from '@/lib/auth';
-import { ok, notFound, badRequest } from '@/lib/api';
+import { getDb, toId, idString } from '@/lib/db';
+import { withAuth, isAdmin, publicUser } from '@/lib/auth';
+import { ok, notFound, badRequest, forbidden } from '@/lib/api';
 
-/** Look a user up by ObjectId or by Auth0 id — both are used as handles. */
-async function findUser(db, id) {
-  return (
-    (await db.collection('users').findOne({ _id: toId(id) })) ||
-    (await db.collection('users').findOne({ auth0Id: id }))
-  );
+const ROLES = ['sender', 'carrier', 'admin'];
+
+/** Fields an account holder may change about themselves. */
+const SELF_EDITABLE = ['firstName', 'lastName', 'phoneNumber', 'dateOfBirth', 'address', 'avatarColor'];
+/** Fields only an administrator may change. */
+const ADMIN_EDITABLE = [...SELF_EDITABLE, 'roles', 'isActive'];
+
+function isSelf(profile, user) {
+  return idString(profile._id) === idString(user._id);
 }
 
-export const GET = withAuth(['read:users'], async (req, { params }) => {
+/** Anyone signed in can see a public profile; the full record is for its owner and admins. */
+export const GET = withAuth(async (req, { params, profile }) => {
   const db = await getDb();
-  const user = await findUser(db, params.id);
+  const user = await db.collection('users').findOne({ _id: toId(params.id) });
   if (!user) return notFound('User not found');
-  return ok({ user });
+
+  const full = isSelf(profile, user) || isAdmin(profile);
+  return ok({ user: full ? user : publicUser(user) });
 });
 
-export const PUT = withAuth(['write:users'], async (req, { params }) => {
+export const PUT = withAuth(async (req, { params, profile }) => {
   const db = await getDb();
-  const user = await findUser(db, params.id);
+  const user = await db.collection('users').findOne({ _id: toId(params.id) });
   if (!user) return notFound('User not found');
 
-  const body = await req.json();
+  const admin = isAdmin(profile);
+  if (!isSelf(profile, user) && !admin) return forbidden('You can only edit your own profile');
 
-  // Identity, verification state and reputation are not client-editable.
-  const immutable = ['_id', 'auth0Id', 'kycStatus', 'rating', 'createdAt'];
-  const updates = Object.fromEntries(Object.entries(body).filter(([key]) => !immutable.includes(key)));
+  const body = await req.json();
+  const editable = admin ? ADMIN_EDITABLE : SELF_EDITABLE;
+  const updates = Object.fromEntries(Object.entries(body).filter(([key]) => editable.includes(key)));
   if (!Object.keys(updates).length) return badRequest('No editable fields supplied');
 
-  await db.collection('users').updateOne(
-    { _id: user._id },
-    { $set: { ...updates, updatedAt: new Date() } }
-  );
+  if ('roles' in updates) {
+    if (!Array.isArray(updates.roles) || updates.roles.some((role) => !ROLES.includes(role))) {
+      return badRequest(`roles must be any of: ${ROLES.join(', ')}`);
+    }
+  }
+  if ('isActive' in updates) updates.isActive = Boolean(updates.isActive);
+  if (updates.dateOfBirth) {
+    const dob = new Date(updates.dateOfBirth);
+    if (Number.isNaN(dob.getTime())) return badRequest('dateOfBirth must be a valid date');
+    updates.dateOfBirth = dob;
+  }
+
+  await db.collection('users').updateOne({ _id: user._id }, { $set: { ...updates, updatedAt: new Date() } });
 
   const updated = await db.collection('users').findOne({ _id: user._id });
   return ok({ message: 'User updated', user: updated });
 });
 
-export const DELETE = withAuth(['write:users'], async (req, { params }) => {
+export const DELETE = withAuth(async (req, { params, profile }) => {
   const db = await getDb();
-  const user = await findUser(db, params.id);
+  const user = await db.collection('users').findOne({ _id: toId(params.id) });
   if (!user) return notFound('User not found');
+
+  if (!isSelf(profile, user) && !isAdmin(profile)) {
+    return forbidden('You can only deactivate your own account');
+  }
 
   // Soft delete — matches and ratings reference this user.
   await db.collection('users').updateOne(

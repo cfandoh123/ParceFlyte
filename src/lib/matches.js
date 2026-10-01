@@ -1,10 +1,12 @@
 import { toId } from './db';
+import { publicUser } from './auth';
 
 /** How long a proposed match stays open before it expires. */
 export const MATCH_TTL_DAYS = 7;
 
 /**
- * Attach the parcel, travel, sender and carrier each match references.
+ * Attach the parcel, travel, sender and carrier each match references. The two
+ * people are reduced to their public profile — a match is seen by both sides.
  * Four queries total regardless of how many matches are passed in.
  */
 export async function hydrateMatches(db, matches) {
@@ -36,7 +38,7 @@ export async function hydrateMatches(db, matches) {
     ...match,
     parcel: parcelMap[String(match.parcelId)] || null,
     travel: travelMap[String(match.travelId)] || null,
-    sender: userMap[String(match.senderId)] || null,
-    carrier: userMap[String(match.carrierId)] || null,
+    sender: publicUser(userMap[String(match.senderId)]),
+    carrier: publicUser(userMap[String(match.carrierId)]),
   }));
 }

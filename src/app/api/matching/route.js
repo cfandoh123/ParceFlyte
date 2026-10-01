@@ -1,5 +1,6 @@
-import { withAuth } from '@/lib/auth';
-import { ok, pagination, paginated } from '@/lib/api';
+import { getDb, toId, idString } from '@/lib/db';
+import { withAuth, isAdmin } from '@/lib/auth';
+import { ok, notFound, forbidden, pagination, paginated } from '@/lib/api';
 import matchingService from '@/lib/matching-service';
 
 /** These handlers read the request and the session, so they are never prerendered. */
@@ -12,7 +13,7 @@ export const dynamic = 'force-dynamic';
  * returned with a full score breakdown. Without it, this is a plain search over
  * open travels — useful before a sender has listed anything.
  */
-export const GET = withAuth(['read:matches'], async (req) => {
+export const GET = withAuth(async (req, { profile }) => {
   const { searchParams } = new URL(req.url);
   const { page, limit, skip } = pagination(searchParams);
   const get = (key) => searchParams.get(key);
@@ -20,6 +21,13 @@ export const GET = withAuth(['read:matches'], async (req) => {
   const parcelId = get('parcelId');
 
   if (parcelId) {
+    const db = await getDb();
+    const parcel = await db.collection('parcels').findOne({ _id: toId(parcelId) });
+    if (!parcel) return notFound('Parcel not found');
+    if (idString(parcel.senderId) !== idString(profile._id) && !isAdmin(profile)) {
+      return forbidden('Only the sender can look for carriers for this parcel');
+    }
+
     const options = {
       maxFee: get('maxFee') || undefined,
       travelMode: get('travelMode') || undefined,

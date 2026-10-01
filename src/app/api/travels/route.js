@@ -1,5 +1,5 @@
 import { getDb, toId } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAuth, publicUser } from '@/lib/auth';
 import { ok, badRequest, pagination, paginated, requireFields, positiveNumber, parseDate } from '@/lib/api';
 import { CITIES } from '@/lib/demo-data';
 
@@ -18,7 +18,7 @@ function withCoordinates(place) {
   };
 }
 
-export const GET = withAuth(['read:travels'], async (req) => {
+export const GET = withAuth(async (req) => {
   const db = await getDb();
   const { searchParams } = new URL(req.url);
   const { page, limit, skip } = pagination(searchParams);
@@ -53,16 +53,15 @@ export const GET = withAuth(['read:travels'], async (req) => {
 
   const withCarrier = travels.map((travel) => ({
     ...travel,
-    carrier: carrierMap[String(travel.carrierId)] || null,
+    carrier: publicUser(carrierMap[String(travel.carrierId)]),
   }));
 
   return ok(paginated(withCarrier, total, { page, limit }));
 });
 
-export const POST = withAuth(['write:travels'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const body = await req.json();
-  const profile = await currentUser(db, user);
 
   const missing = requireFields(body, [
     'departureLocation.city',
@@ -101,7 +100,7 @@ export const POST = withAuth(['write:travels'], async (req, { user }) => {
 
   const now = new Date();
   const newTravel = {
-    carrierId: body.carrierId ? toId(body.carrierId) : profile?._id,
+    carrierId: profile._id,
     departureLocation: departure,
     arrivalLocation: arrival,
     travelMode: body.travelMode,
@@ -117,8 +116,6 @@ export const POST = withAuth(['write:travels'], async (req, { user }) => {
     createdAt: now,
     updatedAt: now,
   };
-
-  if (!newTravel.carrierId) return badRequest('Could not resolve the carrier for this travel');
 
   const result = await db.collection('travels').insertOne(newTravel);
   const created = await db.collection('travels').findOne({ _id: toId(result.insertedId) });

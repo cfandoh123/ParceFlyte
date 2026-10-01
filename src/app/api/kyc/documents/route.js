@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
+import { withAuth } from '@/lib/auth';
 import { ok, badRequest, notFound, requireFields } from '@/lib/api';
+import { loadApplication } from '@/lib/kyc-service';
 
 const DOCUMENT_TYPES = ['passport', 'drivers_license', 'national_id', 'birth_certificate', 'utility_bill'];
 const IMAGE_TYPES = ['front', 'back', 'selfie_with_document'];
@@ -14,17 +15,9 @@ const REQUIRED_IMAGES = {
   utility_bill: ['front'],
 };
 
-async function loadApplication(db, profile, kycId) {
-  return kycId
-    ? db.collection('kyc').findOne({ kycId })
-    : db.collection('kyc').findOne({ userId: profile._id });
-}
-
 /** Upload an identity document and its images. */
-export const POST = withAuth(['write:users'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
-  const profile = await currentUser(db, user);
-  if (!profile) return notFound('User not found');
 
   const body = await req.json();
   const missing = requireFields(body, ['documentType', 'documentNumber', 'issuingCountry']);
@@ -92,10 +85,8 @@ export const POST = withAuth(['write:users'], async (req, { user }) => {
 });
 
 /** Verification status of each uploaded document. */
-export const GET = withAuth(['read:users'], async (req, { user }) => {
+export const GET = withAuth(async (req, { profile }) => {
   const db = await getDb();
-  const profile = await currentUser(db, user);
-  if (!profile) return notFound('User not found');
 
   const { searchParams } = new URL(req.url);
   const application = await loadApplication(db, profile, searchParams.get('kycId'));

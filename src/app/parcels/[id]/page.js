@@ -165,14 +165,16 @@ function CandidateCard({ candidate, parcelId, onProposed }) {
 }
 
 /** Delivery progress for a matched parcel. */
-function TrackingTimeline({ parcel, onAdvance }) {
+function TrackingTimeline({ parcel, isSender, onAdvance }) {
   const { toast } = useToast();
   const [busy, setBusy] = useState(false);
 
   const STEPS = ['matched', 'picked_up', 'in_transit', 'out_for_delivery', 'delivered'];
   const history = parcel.trackingHistory || [];
   const reached = new Set(history.map((h) => h.status));
-  const nextStep = STEPS.find((s) => !reached.has(s));
+  const upcoming = STEPS.find((s) => !reached.has(s));
+  // Confirming delivery releases the payment, so only the sender is offered it.
+  const nextStep = upcoming === 'delivered' && !isSender ? null : upcoming;
 
   const advance = async () => {
     setBusy(true);
@@ -219,12 +221,12 @@ function TrackingTimeline({ parcel, onAdvance }) {
             </li>
           ))}
 
-          {nextStep && (
+          {upcoming && (
             <li className="flex gap-3 opacity-50">
               <span className="flex h-6 w-6 items-center justify-center rounded-full border-2 border-dashed">
                 <CircleDot className="h-3 w-3" />
               </span>
-              <p className="text-sm">{humanize(nextStep)}</p>
+              <p className="text-sm">{humanize(upcoming)}</p>
             </li>
           )}
         </ol>
@@ -365,7 +367,11 @@ export default function ParcelDetailPage() {
       {/* Tracking, once matched */}
       {parcel.status !== 'pending' && (
         <div className="mt-6">
-          <TrackingTimeline parcel={parcel} onAdvance={refreshAll} />
+          <TrackingTimeline
+            parcel={parcel}
+            isSender={String(parcel.senderId) === String(user?._id)}
+            onAdvance={refreshAll}
+          />
         </div>
       )}
 

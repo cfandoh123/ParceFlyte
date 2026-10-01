@@ -1,10 +1,10 @@
 import { getDb, toId, idString } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
-import { ok, badRequest, notFound, conflict, pagination, paginated, requireFields } from '@/lib/api';
+import { withAuth, restrictToParty } from '@/lib/auth';
+import { ok, badRequest, notFound, forbidden, conflict, pagination, paginated, requireFields } from '@/lib/api';
 import matchingService from '@/lib/matching-service';
 import { hydrateMatches, MATCH_TTL_DAYS } from '@/lib/matches';
 
-export const GET = withAuth(['read:matches'], async (req, { user }) => {
+export const GET = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const { searchParams } = new URL(req.url);
   const { page, limit, skip } = pagination(searchParams);
@@ -20,19 +20,21 @@ export const GET = withAuth(['read:matches'], async (req, { user }) => {
 
   // `mine=true` returns everything the caller is a party to, either side.
   if (get('mine') === 'true') {
-    const profile = await currentUser(db, user);
     if (profile) query.$or = [{ senderId: profile._id }, { carrierId: profile._id }];
   }
 
+  // Whatever the filters, a list only contains matches the caller is a party to.
+  const scoped = restrictToParty(query, profile, ['senderId', 'carrierId']);
+
   const [matches, total] = await Promise.all([
-    db.collection('matches').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-    db.collection('matches').countDocuments(query),
+    db.collection('matches').find(scoped).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('matches').countDocuments(scoped),
   ]);
 
   return ok(paginated(await hydrateMatches(db, matches), total, { page, limit }));
 });
 
-export const POST = withAuth(['write:matches'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const body = await req.json();
 
@@ -45,6 +47,12 @@ export const POST = withAuth(['write:matches'], async (req, { user }) => {
   ]);
   if (!parcel) return notFound('Parcel not found');
   if (!travel) return notFound('Travel not found');
+
+  const isSender = idString(parcel.senderId) === idString(profile._id);
+  const isCarrier = idString(travel.carrierId) === idString(profile._id);
+  if (!isSender && !isCarrier) {
+    return forbidden('Only the parcel’s sender or the trip’s carrier can propose this match');
+  }
 
   if (parcel.status !== 'pending') return badRequest('This parcel is no longer open for matching');
   if (!['planned', 'confirmed'].includes(travel.status)) {
@@ -66,7 +74,6 @@ export const POST = withAuth(['write:matches'], async (req, { user }) => {
   });
   if (existing) return conflict('A match already exists for this parcel and travel', { matchId: existing._id });
 
-  const profile = await currentUser(db, user);
   const carrier = await db.collection('users').findOne({ _id: toId(travel.carrierId) });
   const score = matchingService.calculateMatchScore(parcel, travel, carrier);
   const pricing = matchingService.suggestPricing(parcel, travel);

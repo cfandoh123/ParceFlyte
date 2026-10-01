@@ -10,6 +10,7 @@
  */
 
 import { getDemoDb } from './demo-store';
+import { ensureIndexes } from './indexes';
 
 export const DB_NAME = 'parceflyte';
 
@@ -21,18 +22,26 @@ export function isDemoMode() {
 
 let clientPromise = null;
 
-function getClientPromise() {
+/** Connect, then make sure the indexes exist before the first query runs. */
+async function connect() {
   const { MongoClient } = require('mongodb');
-  const uri = process.env.MONGODB_URI;
+  const client = await new MongoClient(process.env.MONGODB_URI).connect();
+  try {
+    await ensureIndexes(client.db(DB_NAME));
+  } catch (error) {
+    // A missing index costs speed, not correctness of reads — keep serving.
+    console.error('[db] could not ensure indexes', error);
+  }
+  return client;
+}
 
+function getClientPromise() {
   if (process.env.NODE_ENV === 'development') {
-    if (!globalThis._mongoClientPromise) {
-      globalThis._mongoClientPromise = new MongoClient(uri).connect();
-    }
+    if (!globalThis._mongoClientPromise) globalThis._mongoClientPromise = connect();
     return globalThis._mongoClientPromise;
   }
 
-  if (!clientPromise) clientPromise = new MongoClient(uri).connect();
+  if (!clientPromise) clientPromise = connect();
   return clientPromise;
 }
 

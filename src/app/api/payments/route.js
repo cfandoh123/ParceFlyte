@@ -1,10 +1,10 @@
 import { getDb, toId, idString } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
-import { ok, badRequest, notFound, conflict, pagination, paginated, requireFields } from '@/lib/api';
+import { withAuth, isAdmin, restrictToParty } from '@/lib/auth';
+import { ok, badRequest, notFound, forbidden, conflict, pagination, paginated, requireFields } from '@/lib/api';
 
 const METHODS = ['stripe', 'paypal', 'bank_transfer', 'crypto'];
 
-export const GET = withAuth(['read:payments'], async (req, { user }) => {
+export const GET = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const { searchParams } = new URL(req.url);
   const { page, limit, skip } = pagination(searchParams);
@@ -24,20 +24,21 @@ export const GET = withAuth(['read:payments'], async (req, { user }) => {
   }
 
   if (get('mine') === 'true') {
-    const profile = await currentUser(db, user);
     if (profile) query.$or = [{ senderId: profile._id }, { carrierId: profile._id }];
   }
 
+  const scoped = restrictToParty(query, profile, ['senderId', 'carrierId']);
+
   const [payments, total] = await Promise.all([
-    db.collection('payments').find(query).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
-    db.collection('payments').countDocuments(query),
+    db.collection('payments').find(scoped).sort({ createdAt: -1 }).skip(skip).limit(limit).toArray(),
+    db.collection('payments').countDocuments(scoped),
   ]);
 
   return ok(paginated(payments, total, { page, limit }));
 });
 
 /** Fund escrow for an accepted match. */
-export const POST = withAuth(['write:payments'], async (req) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const body = await req.json();
 
@@ -46,6 +47,9 @@ export const POST = withAuth(['write:payments'], async (req) => {
 
   const match = await db.collection('matches').findOne({ _id: toId(body.matchId) });
   if (!match) return notFound('Match not found');
+  if (idString(match.senderId) !== idString(profile._id)) {
+    return forbidden('Only the sender pays for a match');
+  }
   if (match.status !== 'accepted') return badRequest('Only accepted matches can be paid for');
 
   const existing = await db.collection('payments').findOne({ matchId: match._id });
@@ -86,7 +90,7 @@ export const POST = withAuth(['write:payments'], async (req) => {
 });
 
 /** Release escrow to the carrier, or refund the sender. */
-export const PUT = withAuth(['write:payments'], async (req, { user }) => {
+export const PUT = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const body = await req.json();
 
@@ -103,7 +107,19 @@ export const PUT = withAuth(['write:payments'], async (req, { user }) => {
     return badRequest(`Escrow is already ${payment.escrowStatus}`);
   }
 
-  const profile = await currentUser(db, user);
+  const isSender = idString(payment.senderId) === idString(profile._id);
+  const isCarrier = idString(payment.carrierId) === idString(profile._id);
+  const admin = isAdmin(profile);
+  if (!isSender && !isCarrier && !admin) return forbidden('You are not a party to this payment');
+  // Money only moves away from whoever asks: the sender can release it to the
+  // carrier, the carrier can hand it back. Anything else is a dispute.
+  if (body.action === 'release' && !isSender && !admin) {
+    return forbidden('Only the sender can release payment to the carrier');
+  }
+  if (body.action === 'refund' && !isCarrier && !admin) {
+    return forbidden('Only the carrier can refund the sender — open a dispute instead');
+  }
+
   const now = new Date();
 
   if (body.action === 'dispute') {

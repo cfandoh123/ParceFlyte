@@ -1,14 +1,23 @@
 import { getDb, toId, idString } from '@/lib/db';
-import { withAuth, currentUser } from '@/lib/auth';
-import { ok, badRequest, notFound, requireFields } from '@/lib/api';
+import { withAuth, isAdmin } from '@/lib/auth';
+import { ok, badRequest, notFound, forbidden, requireFields } from '@/lib/api';
 import matchingService from '@/lib/matching-service';
 import { hydrateMatches, MATCH_TTL_DAYS } from '@/lib/matches';
 
+function ownsParcel(parcel, profile) {
+  return idString(parcel.senderId) === idString(profile._id) || isAdmin(profile);
+}
+
 /** Preview the top auto-match candidates without creating anything. */
-export const GET = withAuth(['read:matches'], async (req) => {
+export const GET = withAuth(async (req, { profile }) => {
   const { searchParams } = new URL(req.url);
   const parcelId = searchParams.get('parcelId');
   if (!parcelId) return badRequest('parcelId is required');
+
+  const db = await getDb();
+  const parcel = await db.collection('parcels').findOne({ _id: toId(parcelId) });
+  if (!parcel) return notFound('Parcel not found');
+  if (!ownsParcel(parcel, profile)) return forbidden('Only the sender can auto-match this parcel');
 
   const limit = parseInt(searchParams.get('limit')) || 5;
   const suggestions = await matchingService.autoMatchParcel(parcelId, { limit });
@@ -22,7 +31,7 @@ export const GET = withAuth(['read:matches'], async (req) => {
 });
 
 /** Create match proposals for every candidate above the auto-match threshold. */
-export const POST = withAuth(['write:matches'], async (req, { user }) => {
+export const POST = withAuth(async (req, { profile }) => {
   const db = await getDb();
   const body = await req.json();
 
@@ -31,9 +40,9 @@ export const POST = withAuth(['write:matches'], async (req, { user }) => {
 
   const parcel = await db.collection('parcels').findOne({ _id: toId(body.parcelId) });
   if (!parcel) return notFound('Parcel not found');
+  if (!ownsParcel(parcel, profile)) return forbidden('Only the sender can auto-match this parcel');
   if (parcel.status !== 'pending') return badRequest('This parcel is no longer open for matching');
 
-  const profile = await currentUser(db, user);
   const candidates = await matchingService.autoMatchParcel(body.parcelId, {
     ...(body.criteria || {}),
     limit: body.limit || 5,

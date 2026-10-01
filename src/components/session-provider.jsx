@@ -4,23 +4,32 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 
 const SessionContext = createContext(null);
 
+const SIGNED_OUT = { user: null, demoMode: false, authEnabled: false, loading: false, error: null };
+
 /**
  * Loads the signed-in user from /api/session.
  *
  * This works the same whether the app is running on Auth0 or on the demo
- * session, so no component needs to know which is in play.
+ * session: `user` is null when nobody is signed in, and `authEnabled` says
+ * whether there is a real sign-in to send them to.
  */
 export function SessionProvider({ children }) {
-  const [state, setState] = useState({ user: null, demoMode: false, loading: true, error: null });
+  const [state, setState] = useState({ ...SIGNED_OUT, loading: true });
 
   const refresh = useCallback(async () => {
     try {
       const res = await fetch('/api/session');
-      if (!res.ok) throw new Error('Could not load your session');
-      const data = await res.json();
-      setState({ user: data.user, demoMode: data.demoMode, loading: false, error: null });
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error || 'Could not load your session');
+      setState({
+        user: data.user,
+        demoMode: data.demoMode,
+        authEnabled: data.authEnabled,
+        loading: false,
+        error: null,
+      });
     } catch (error) {
-      setState({ user: null, demoMode: false, loading: false, error: error.message });
+      setState({ ...SIGNED_OUT, error: error.message });
     }
   }, []);
 

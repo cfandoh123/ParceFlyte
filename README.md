@@ -2,7 +2,7 @@
 
 ParceFlyte is a peer-to-peer parcel delivery platform that connects senders with travellers (carriers) who have spare luggage capacity along a route they are already taking. It handles carrier discovery, multi-factor match scoring, fee negotiation, escrowed payment, two-sided ratings, and a KYC/compliance layer with an admin review queue.
 
-**It runs with zero configuration.** Clone, `npm install`, `npm run dev` — no database, no Auth0 tenant. The app boots in demo mode against a seeded in-memory dataset and a fixed demo user, so every screen is explorable immediately. Point `MONGODB_URI` and the Auth0 variables at real infrastructure and the same code runs against those instead.
+**It runs with zero configuration.** Clone, `npm install`, `npm run dev` — no database, no Auth0 tenant. The app boots in demo mode against a seeded in-memory dataset and a fixed demo user, so every screen is explorable immediately. Point `MONGODB_URI` and the Auth0 variables at real infrastructure and the same code runs against those instead, with real accounts created on first sign-in.
 
 ---
 
@@ -31,7 +31,7 @@ ParceFlyte is a peer-to-peer parcel delivery platform that connects senders with
 ## Quick start
 
 ```bash
-git clone https://github.com/yourusername/parceflyte.git
+git clone https://github.com/cfandoh123/ParceFlyte.git
 cd ParceFlyte
 npm install
 npm run dev
@@ -46,6 +46,7 @@ Open [http://localhost:3000](http://localhost:3000). You are signed in as **Calv
 | `npm start` | Serve the production build |
 | `npm run lint` | ESLint |
 | `npm run seed` | Load the demo dataset + indexes into MongoDB (needs `MONGODB_URI`) |
+| `npm run db:init` | Create the indexes only, leaving the database empty for real users |
 
 ### A tour worth taking
 
@@ -107,8 +108,8 @@ One Next.js 14 App Router application. No separate backend — API routes and Re
 ┌──────────────────────────────▼───────────────────────────────────────┐
 │  Next.js App Router (src/app)                                        │
 │                                                                      │
-│  Every route wrapped in withAuth(scopes, handler) — src/lib/auth.js   │
-│  Delegates to Auth0 when configured, demo session when not           │
+│  Every route wrapped in withAuth(handler) — src/lib/auth.js          │
+│  Auth0 session when configured, demo session when not                │
 │                                                                      │
 │  /api/session   /api/users    /api/travels   /api/parcels            │
 │  /api/matches   ├─ [id]/accept · reject · negotiate                  │
@@ -140,7 +141,7 @@ One Next.js 14 App Router application. No separate backend — API routes and Re
 
 **`toId()` bridges id types.** Mongo needs `ObjectId`; the demo store compares ids as strings. Every route uses `toId()` and never constructs an `ObjectId` directly, so the same query works on both. Demo ids are 24-char hex, so the seed loads into MongoDB unchanged.
 
-**Auth is a wrapper, not a fork.** Routes call `withAuth(['read:parcels'], handler)`. With Auth0 configured it delegates to `withApiAuthRequired` and requests a scoped token; without it, the handler runs as the demo user. Handlers receive `ctx.user` either way.
+**Auth is a wrapper, not a fork.** Routes call `withAuth(handler)`. With Auth0 configured the caller is the signed-in Auth0 user, whose ParceFlyte profile is created on first sign-in; without it, the handler runs as the demo user. Handlers receive `ctx.profile` — the caller's user document — either way.
 
 **Matching is a stateless singleton.** [`matching-service.js`](src/lib/matching-service.js) holds only weights as state. Every method takes what it needs as arguments, so it is safe to share across concurrent requests and trivial to test.
 
@@ -154,10 +155,10 @@ Demo mode is on whenever `MONGODB_URI` is unset, or `NEXT_PUBLIC_DEMO_MODE=true`
 
 - **Data** comes from [`src/lib/demo-data.js`](src/lib/demo-data.js): 8 users, 13 trips, 5 parcels, 4 matches, payments, ratings, and 3 KYC applications at different stages. Dates are generated relative to load time, so trips are always upcoming and deadlines never stale.
 - **State** lives on `globalThis`, so it survives hot module replacement — anything you create while developing is still there after an edit. It resets when the server restarts, or via `POST /api/demo/reset`.
-- **The session** is a fixed user (`DEMO_SESSION_USER` in [`src/lib/auth.js`](src/lib/auth.js)) holding the `sender`, `carrier` and `admin` roles so every surface is reachable.
+- **The session** is a fixed user (`DEMO_SESSION_USER` in [`src/lib/auth.js`](src/lib/auth.js)) holding the `sender`, `carrier` and `admin` roles so every surface is reachable. It is only ever used on the in-memory dataset or outside production: a production deployment with a real database and no Auth0 answers 503 instead.
 - **File uploads** in the KYC flow record the file name only; nothing is stored.
 
-Auth0 and MongoDB are independent switches. Configuring one without the other works fine.
+Auth0 and MongoDB are independent switches in development. In production, a real database requires Auth0.
 
 ---
 
@@ -204,7 +205,8 @@ ParceFlyte/
     │   ├── db.js                     ← getDb(), toId(), isDemoMode()
     │   ├── demo-data.js              ← the seed dataset
     │   ├── demo-store.js             ← in-memory Mongo-compatible store
-    │   ├── auth.js                   ← withAuth(), currentUser()
+    │   ├── indexes.js                ← MongoDB indexes, applied on connect
+    │   ├── auth.js                   ← withAuth(), withAdmin()  
     │   ├── api.js                    ← response helpers, validation
     │   ├── matching-service.js       ← scoring and quoting
     │   ├── kyc-service.js            ← risk, compliance, document checks
@@ -326,44 +328,44 @@ Coordinates are attached on write from a known-cities table, which is what makes
 
 ## API reference
 
-Every route except `/api/auth/[auth0]` and `/api/demo/reset` goes through `withAuth`. Collection endpoints take `page` and `limit` and return `{ data, pagination: { page, limit, total, totalPages, hasMore } }`.
+Every route except `/api/auth/[auth0]`, `/api/session` and `/api/demo/reset` goes through `withAuth` (or `withAdmin`) and answers 401 to anonymous callers. Collection endpoints take `page` and `limit` and return `{ data, pagination: { page, limit, total, totalPages, hasMore } }`.
 
 ### Session and demo
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/session` | Signed-in user + whether demo mode is on. The client bootstraps from this. |
+| `GET` | `/api/session` | Signed-in user (or `null`), whether demo mode is on, and whether real sign-in is enabled. The client bootstraps from this. |
 | `POST` | `/api/demo/reset` | Restore the seed. Demo mode only — 403 otherwise. |
-| `GET`/`POST` | `/api/auth/[auth0]` | Auth0 login/logout/callback/me; redirects in demo mode. |
+| `GET`/`POST` | `/api/auth/[auth0]` | Auth0 login/signup/logout/callback/me; redirects in demo mode. |
 
-### Users — `read:users` / `write:users`
+### Users
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/users` | Filters: `role`, `kycStatus` |
-| `POST` | `/api/users` | Rejects duplicate `auth0Id` or `email`; validates roles |
-| `GET`/`PUT`/`DELETE` | `/api/users/[id]` | `id` is an ObjectId or an `auth0Id`. PUT refuses `kycStatus` and `rating`. DELETE is a soft deactivate. |
+| `GET` | `/api/users` | Admin only. Filters: `role`, `kycStatus`. There is no create endpoint — profiles are created on first sign-in. |
+| `GET` | `/api/users/[id]` | The full record for its owner and admins; a public profile (name, rating, KYC status) for everyone else. |
+| `PUT`/`DELETE` | `/api/users/[id]` | Owner or admin. PUT accepts name, phone, date of birth, address; only an admin can change `roles` or `isActive`. DELETE is a soft deactivate, which locks the account out. |
 
-### Travels — `read:travels` / `write:travels`
+### Travels
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/travels` | Filters: `carrierId`, cities, countries, `travelMode`, `status`, `minCapacity`, `maxFee`, dates, `upcoming`. Joins carriers in one query. |
-| `POST` | `/api/travels` | Validates mode, date order, positive capacity and fee, distinct cities. Attaches coordinates. |
-| `GET`/`PUT`/`DELETE` | `/api/travels/[id]` | Carrier-only. DELETE refuses if accepted matches exist. |
+| `GET` | `/api/travels` | Filters: `carrierId`, cities, countries, `travelMode`, `status`, `minCapacity`, `maxFee`, dates, `upcoming`. Joins carriers' public profiles in one query. |
+| `POST` | `/api/travels` | Posted as the caller. Validates mode, date order, positive capacity and fee, distinct cities. Attaches coordinates. |
+| `GET`/`PUT`/`DELETE` | `/api/travels/[id]` | PUT and DELETE are carrier-only. DELETE refuses if accepted matches exist. |
 
-### Parcels — `read:parcels` / `write:parcels`
+### Parcels
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/parcels` | Filters: `senderId`, `matchedCarrierId`, `status`, `category`, weight/value ranges, `deliveryDeadline` |
-| `POST` | `/api/parcels` | Validates category, handling flags, future deadline, distinct origin/destination |
-| `GET` | `/api/parcels/[id]` | Hydrated with sender and carrier |
-| `POST` | `/api/parcels/[id]` | Append a tracking event. `delivered` releases escrow. Participants only. |
+| `GET` | `/api/parcels` | Only parcels you sent or are carrying (admins see all). Filters: `senderId`, `matchedCarrierId`, `status`, `category`, weight/value ranges, `deliveryDeadline` |
+| `POST` | `/api/parcels` | Listed as the caller. Validates category, handling flags, future deadline, distinct origin/destination |
+| `GET` | `/api/parcels/[id]` | Sender, admins, and carriers it is matched or proposed to. Hydrated with sender and carrier public profiles |
+| `POST` | `/api/parcels/[id]` | Append a tracking event once matched. Participants only; only the sender can mark `delivered`, which releases escrow. |
 | `DELETE` | `/api/parcels/[id]` | Sender-only; refuses once in transit |
 
-### Matches — `read:matches` / `write:matches`
+### Matches
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/matches` | `mine=true` returns everything you are a party to, either side |
-| `POST` | `/api/matches` | Verifies parcel is open, travel is accepting, capacity fits, not self-carriage, no duplicate, fee under cap |
-| `GET`/`PUT`/`DELETE` | `/api/matches/[id]` | PUT edits agreement details only — status changes go through the endpoints below |
+| `GET` | `/api/matches` | Only matches you are a party to, either side (admins see all) |
+| `POST` | `/api/matches` | Caller must be the parcel's sender or the trip's carrier. Verifies parcel is open, travel is accepting, capacity fits, not self-carriage, no duplicate, fee under cap |
+| `GET`/`PUT`/`DELETE` | `/api/matches/[id]` | Parties only. PUT edits agreement details while the match is still proposed — status changes go through the endpoints below |
 | `POST` | `/api/matches/[id]/negotiate` | Append a counter-offer |
 | `GET` | `/api/matches/[id]/negotiate` | Thread + suggested range + cap |
 | `POST` | `/api/matches/[id]/accept` | Locks the fee, matches the parcel, decrements capacity, funds escrow, expires competing matches |
@@ -372,18 +374,18 @@ Every route except `/api/auth/[auth0]` and `/api/demo/reset` goes through `withA
 ### Matching
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/matching` | With `parcelId`, returns scored candidates with breakdowns (`mode: "scored"`). Without, a plain travel search (`mode: "browse"`). |
+| `GET` | `/api/matching` | With `parcelId` (your own parcel), returns scored candidates with breakdowns (`mode: "scored"`). Without, a plain travel search (`mode: "browse"`). |
 | `GET` | `/api/matching/auto` | Preview candidates above the threshold, creating nothing |
 | `POST` | `/api/matching/auto` | Create proposals for everything above the threshold |
 
-### Payments — `read:payments` / `write:payments`
+### Payments
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET` | `/api/payments` | Filters incl. `escrowStatus`, amount range, `mine` |
-| `POST` | `/api/payments` | Fund escrow for an accepted match; one payment per match |
-| `PUT` | `/api/payments` | `action`: `release` \| `refund` \| `dispute` |
+| `GET` | `/api/payments` | Only payments you are a party to. Filters incl. `escrowStatus`, amount range |
+| `POST` | `/api/payments` | Sender only. Fund escrow for an accepted match; one payment per match |
+| `PUT` | `/api/payments` | `action`: `release` (sender) \| `refund` (carrier) \| `dispute` (either party) |
 
-### Ratings — `read:ratings` / `write:ratings`
+### Ratings
 | Method | Route | Notes |
 | --- | --- | --- |
 | `GET` | `/api/ratings` | Attaches reviewer identity |
@@ -392,12 +394,12 @@ Every route except `/api/auth/[auth0]` and `/api/demo/reset` goes through `withA
 ### KYC
 | Method | Route | Notes |
 | --- | --- | --- |
-| `GET`/`POST`/`PUT` | `/api/kyc` | Your application. POST enforces 18+ and blocks a second in-flight application. |
+| `GET`/`POST`/`PUT` | `/api/kyc` | Your application — another user's reference resolves to nothing. POST enforces 18+ and blocks a second in-flight application. |
 | `POST` | `/api/kyc/documents` | Upload a document; enforces the required image set per document type; rejects expired documents |
 | `GET` | `/api/kyc/documents` | Per-document status, document numbers masked |
 | `POST` | `/api/kyc/verify` | Run risk + compliance + document checks; auto-approves when everything is clean |
 | `GET` | `/api/kyc/verify` | Status and results |
-| `GET` | `/api/admin/kyc` | Review queue, riskiest first. `?status=statistics` returns dashboard counters. |
+| `GET` | `/api/admin/kyc` | Admin only, like every `/api/admin` route. Review queue, riskiest first. `?status=statistics` returns dashboard counters. |
 | `POST` | `/api/admin/kyc` | `decision`: `approve` \| `reject` \| `request_info`. Rejection requires a reason. Mirrors to `users.kycStatus`. |
 | `PUT` | `/api/admin/kyc` | Manual risk-score override, recorded in the audit trail |
 
@@ -529,30 +531,30 @@ Bands: low 0–19, medium 20–34, high 35–49, very high 50+. Flagged at 35 an
 
 ## Authentication and authorization
 
-Routes declare the scope they need:
-
 ```js
-export const GET = withAuth(['read:parcels'], async (req, { user }) => { … });
+export const GET = withAuth(async (req, { profile }) => { … });
+export const POST = withAdmin(async (req, { profile }) => { … });
 ```
 
-With Auth0 configured this requests a scoped access token and resolves the session user. Without it, the handler runs as the demo user. Either way the handler receives `ctx.user`, and `currentUser(db, ctx.user)` resolves the ParceFlyte profile.
+**Who is calling.** With Auth0 configured, `withAuth` reads the Auth0 session cookie; no session is a 401. The first time an identity signs in, a ParceFlyte profile is created for it from the provider's claims, with the `sender` and `carrier` roles. A sign-in whose *verified* email matches an existing profile links to that profile, so one person using two sign-in methods has one account; unverified emails never link. Deactivated accounts get a 403.
 
-| Resource | Read | Write |
-| --- | --- | --- |
-| Users | `read:users` | `write:users` |
-| Parcels | `read:parcels` | `write:parcels` |
-| Travels | `read:travels` | `write:travels` |
-| Matches | `read:matches` | `write:matches` |
-| Payments | `read:payments` | `write:payments` |
-| Ratings | `read:ratings` | `write:ratings` |
+**Admins.** Emails listed in `ADMIN_EMAILS` are granted the `admin` role when they sign in with a verified email. An existing admin can also grant roles through `PUT /api/users/[id]`.
 
-Beyond scopes, routes enforce **ownership**: only a match's sender or carrier can negotiate, accept or reject it; only a parcel's sender can cancel it; only a travel's carrier can edit it. The admin nav appears only for users holding the `admin` role.
+**What they may do.** Authorization is by ownership and role, checked against the profile in the database — never against ids in the request body:
+
+- A parcel is posted as the caller, listed only to its sender and carrier, and opened only by them, admins, and carriers it has been proposed to.
+- Only a match's two parties can read, negotiate, accept or reject it; only a parcel's sender can look for carriers for it.
+- Only the sender can confirm delivery or release escrow; only the carrier can refund.
+- Other users are only ever shown a public profile — name, rating, verification status. Email, phone and address stay with the account holder and admins.
+- KYC applications are readable by their owner and admins only.
+
+Signed-out visitors who open an app page are sent to Auth0's hosted login and returned to the page they asked for.
 
 ---
 
 ## Frontend architecture
 
-**Session.** `SessionProvider` fetches `/api/session` once and exposes `useSession()` — `{ user, demoMode, loading, refresh }`. No component knows whether Auth0 is involved.
+**Session.** `SessionProvider` fetches `/api/session` once and exposes `useSession()` — `{ user, demoMode, authEnabled, loading, error, refresh }`. `AppShell` redirects signed-out visitors to sign-in and offers sign-out; no page handles auth itself.
 
 **Shell.** `AppShell` gives every signed-in page a sidebar, a mobile header with a slide-down nav, the demo banner with its reset control, and a consistent title/description/actions header.
 
@@ -568,7 +570,7 @@ Beyond scopes, routes enforce **ownership**: only a match's sender or carrier ca
 
 ## Running against MongoDB and Auth0
 
-Copy `.env.example` to `.env.local` and fill in what you need — they are independent.
+Copy `.env.example` to `.env.local` and fill in what you need.
 
 ### MongoDB
 
@@ -576,13 +578,16 @@ Copy `.env.example` to `.env.local` and fill in what you need — they are indep
 MONGODB_URI=mongodb://localhost:27017/parceflyte
 ```
 
+Indexes are created automatically the first time the app connects, including the unique indexes on `users.auth0Id`, `users.email`, `payments.matchId` and the rating triple that the app relies on.
+
 ```bash
-npm run seed   # loads the demo dataset and creates indexes
+npm run seed      # development: load the demo dataset (drops existing data)
+npm run db:init   # production: create the indexes only, no demo data
 ```
 
-The seed drops existing collections, converts the 24-char hex ids to real `ObjectId`s, and creates the indexes the hot paths need — including `travels` on `{ status, departureDate }`, which serves the matching engine's pre-filter, and unique indexes on `users.auth0Id`, `payments.matchId` and the rating triple.
-
 ### Auth0
+
+Create a **Regular Web Application** in Auth0, then:
 
 ```env
 AUTH0_SECRET=            # openssl rand -hex 32
@@ -590,10 +595,14 @@ AUTH0_BASE_URL=http://localhost:3000
 AUTH0_ISSUER_BASE_URL=https://your-tenant.auth0.com
 AUTH0_CLIENT_ID=
 AUTH0_CLIENT_SECRET=
-AUTH0_AUDIENCE=https://api.parceflyte.com
+ADMIN_EMAILS=you@example.com
 ```
 
-Define the scopes above as permissions on the Auth0 API identified by `AUTH0_AUDIENCE`. Set the callback URL to `http://localhost:3000/api/auth/callback` and the logout URL to `http://localhost:3000`. All five of `AUTH0_SECRET`, `AUTH0_BASE_URL`, `AUTH0_ISSUER_BASE_URL`, `AUTH0_CLIENT_ID` and `AUTH0_CLIENT_SECRET` must be present, or the app stays on the demo session.
+In the application's settings, set **Allowed Callback URLs** to `http://localhost:3000/api/auth/callback` and **Allowed Logout URLs** to `http://localhost:3000` — plus the same pair for each deployed domain. All five `AUTH0_*` variables must be present, or the app stays on the demo session.
+
+### Production
+
+Set `MONGODB_URI`, the five `AUTH0_*` variables (with `AUTH0_BASE_URL` set to the public URL) and `ADMIN_EMAILS` in the host's environment. With a database configured and Auth0 missing, a production build answers 503 rather than serving the demo admin to the public.
 
 ---
 
@@ -609,6 +618,7 @@ Things that are deliberately unfinished, stated plainly:
 - **No email or SMS.** `communicationHistory` records that a notification would have been sent.
 - **ESLint is not enforced at build time.** `next.config.mjs` sets `ignoreDuringBuilds: true`.
 - **Demo state is per-process.** In-memory data does not survive a restart and is not shared across instances. That is fine for a demo, and is exactly why `MONGODB_URI` exists.
+- **KYC is not a gate.** Verification status is shown on profiles, but posting a parcel or a trip does not require it yet.
 
 ---
 
